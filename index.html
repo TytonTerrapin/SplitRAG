@@ -48,7 +48,7 @@
         <div class="space-card" id="card-space1">
           <div class="card-glow card-glow--cyan"></div>
           <div class="space-card-header">
-            <span class="space-card-icon">🔬</span>
+            <span class="space-card-icon">01</span>
             <span class="space-card-num">Space 1</span>
           </div>
           <h2 class="space-card-title">Ingestion Engine</h2>
@@ -64,7 +64,7 @@
         <div class="space-card" id="card-space2">
           <div class="card-glow card-glow--purple"></div>
           <div class="space-card-header">
-            <span class="space-card-icon">🧠</span>
+            <span class="space-card-icon">02</span>
             <span class="space-card-num">Space 2</span>
           </div>
           <h2 class="space-card-title">RAG Query Engine</h2>
@@ -83,42 +83,42 @@
         <div class="pipeline-label">The Pipeline</div>
         <div class="pipeline-flow">
           <div class="pipeline-step" data-step="0">
-            <span class="step-icon">📄</span>
+            <span class="step-icon">1</span>
             <span class="step-label">Document</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="1">
-            <span class="step-icon">🔍</span>
+            <span class="step-icon">2</span>
             <span class="step-label">OCR</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="2">
-            <span class="step-icon">📐</span>
+            <span class="step-icon">3</span>
             <span class="step-label">Layout</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="3">
-            <span class="step-icon">📦</span>
+            <span class="step-icon">4</span>
             <span class="step-label">Chunks</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="4">
-            <span class="step-icon">🕸️</span>
+            <span class="step-icon">5</span>
             <span class="step-label">Graph</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="5">
-            <span class="step-icon">🧲</span>
+            <span class="step-icon">6</span>
             <span class="step-label">Embed</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="6">
-            <span class="step-icon">🔎</span>
+            <span class="step-icon">7</span>
             <span class="step-label">Search</span>
           </div>
           <div class="pipeline-connector"><div class="connector-line"></div><div class="connector-dot"></div></div>
           <div class="pipeline-step" data-step="7">
-            <span class="step-icon">💬</span>
+            <span class="step-icon">8</span>
             <span class="step-label">Answer</span>
           </div>
         </div>
@@ -186,7 +186,12 @@
         </div>
         <!-- File selected state -->
         <div class="drop-zone-selected" id="drop-zone-selected" style="display:none">
-          <div class="selected-file-icon">📄</div>
+          <div class="selected-file-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+          </div>
           <div class="selected-file-name" id="selected-file-name"></div>
           <div class="selected-file-size" id="selected-file-size"></div>
           <button id="change-file-btn" class="change-file-btn">Change file</button>

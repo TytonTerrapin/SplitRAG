@@ -290,12 +290,12 @@ function initUpload() {
    INGESTION PIPELINE
 ══════════════════════════════════════════════════════════════════════ */
 const INGEST_STEPS = [
-  { id: 'upload',   text: 'Uploading document…',                icon: '⏳' },
-  { id: 'ocr',      text: 'Running OCR & layout analysis…',     icon: '🔍' },
-  { id: 'chunk',    text: 'Chunking & structuring content…',     icon: '📦' },
-  { id: 'graph',    text: 'Building knowledge graph…',           icon: '🕸️' },
-  { id: 'rag',      text: 'Forwarding to RAG for indexing…',     icon: '📊' },
-  { id: 'done',     text: 'Ingestion complete!',                 icon: '✅' },
+  { id: 'upload',   text: 'Uploading document…' },
+  { id: 'ocr',      text: 'Running OCR & layout analysis…' },
+  { id: 'chunk',    text: 'Chunking & structuring content…' },
+  { id: 'graph',    text: 'Building knowledge graph…' },
+  { id: 'rag',      text: 'Forwarding to RAG for indexing…' },
+  { id: 'done',     text: 'Ingestion complete!' },
 ];
 
 function createStepElements() {
@@ -306,7 +306,7 @@ function createStepElements() {
     el.className = 'ingest-step';
     el.id = `step-${s.id}`;
     el.innerHTML = `
-      <div class="step-status-icon">${s.icon}</div>
+      <div class="step-status-icon"></div>
       <div class="step-text">${s.text}</div>
     `;
     container.appendChild(el);
@@ -320,14 +320,6 @@ function setStepState(stepId, stepState) {
 
   if (stepState === 'active') {
     gsap.from(el, { opacity: 0, x: -10, duration: 0.3 });
-  }
-  if (stepState === 'done') {
-    const icon = el.querySelector('.step-status-icon');
-    icon.textContent = '✓';
-  }
-  if (stepState === 'error') {
-    const icon = el.querySelector('.step-status-icon');
-    icon.textContent = '✗';
   }
 }
 
@@ -1318,7 +1310,7 @@ function addChatMessage(role, content, isThinking = false, sources = null, isErr
   if (sources && sources.length) {
     const srcBtn = document.createElement('button');
     srcBtn.className = 'chat-sources-btn';
-    srcBtn.textContent = `📄 ${sources.length} source${sources.length > 1 ? 's' : ''}`;
+    srcBtn.textContent = `Sources (${sources.length})`;
     srcBtn.addEventListener('click', () => showSources(sources));
     wrapper.appendChild(srcBtn);
   }
