@@ -524,8 +524,8 @@ function onWorkspaceEnter() {
   const data = state.lastPayload;
   if (!data) return;
 
-  // Set doc name
-  $('ws-doc-name').textContent = state.file?.name ?? 'Document';
+  // Set doc name — use currentDocName for restored docs
+  $('ws-doc-name').textContent = state.currentDocName || state.file?.name || 'Document';
 
   // Hide health strip (workspace has its own)
   gsap.to('#health-strip', { opacity: 0, duration: 0.3 });
@@ -539,6 +539,180 @@ function onWorkspaceEnter() {
   // Update health indicators
   pingHealth();
   pingRAGHealth();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   PERSISTED DOCUMENTS — Load, Restore, Delete
+══════════════════════════════════════════════════════════════════════ */
+async function loadPersistedDocs() {
+  const panel    = $('persisted-docs-panel');
+  const list     = $('persisted-docs-list');
+  const empty    = $('persisted-docs-empty');
+  const loading  = $('persisted-docs-loading');
+  if (!panel) return;
+
+  // Show loading state
+  panel.style.display = 'block';
+  list.innerHTML = '';
+  empty.style.display = 'none';
+  loading.style.display = 'flex';
+
+  try {
+    const r = await fetch(`${RAG_URL}/documents`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+
+    loading.style.display = 'none';
+
+    if (!data.documents || data.documents.length === 0) {
+      empty.style.display = 'block';
+      return;
+    }
+
+    data.documents.forEach((doc, idx) => {
+      const card = document.createElement('div');
+      card.className = 'persisted-doc-card';
+      card.style.animationDelay = `${idx * 0.07}s`;
+      card.id = `persisted-doc-${idx}`;
+      card.dataset.docName = doc.doc_name;
+
+      card.innerHTML = `
+        <div class="persisted-doc-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+        </div>
+        <div class="persisted-doc-info">
+          <div class="persisted-doc-name">${escapeHtml(doc.doc_name)}</div>
+          <div class="persisted-doc-meta">
+            <span>${doc.chunks} chunk${doc.chunks !== 1 ? 's' : ''}</span>
+            <span class="persisted-doc-meta-sep"></span>
+            <span>Ready to explore</span>
+          </div>
+        </div>
+        <div class="persisted-doc-actions">
+          <button class="persisted-doc-restore-btn" title="Restore workspace">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="1 4 1 10 7 10"/>
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+            </svg>
+            Restore
+          </button>
+          <button class="persisted-doc-delete-btn" title="Delete from server">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+          </button>
+        </div>
+        <div class="restore-loading">
+          <div class="persisted-docs-spinner"></div>
+          <span>Restoring…</span>
+        </div>
+      `;
+
+      // Restore button click
+      card.querySelector('.persisted-doc-restore-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        restoreDocument(doc.doc_name, card);
+      });
+
+      // Delete button click
+      card.querySelector('.persisted-doc-delete-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        deletePersistedDoc(doc.doc_name, card);
+      });
+
+      // Clicking the card itself also restores
+      card.addEventListener('click', () => {
+        restoreDocument(doc.doc_name, card);
+      });
+
+      list.appendChild(card);
+    });
+
+  } catch (e) {
+    loading.style.display = 'none';
+    // Don't show panel if RAG server unreachable (not an error for the user)
+    panel.style.display = 'none';
+    console.warn('Could not load persisted docs:', e.message);
+  }
+}
+
+async function restoreDocument(docName, cardEl) {
+  if (cardEl) cardEl.classList.add('restoring');
+
+  try {
+    const r = await fetch(`${RAG_URL}/documents/${encodeURIComponent(docName)}/detail`, {
+      signal: AbortSignal.timeout(30000),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`HTTP ${r.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const data = await r.json();
+
+    // Populate state as if we just ingested
+    state.lastPayload    = data;
+    state.currentDocName = data.doc_name;
+    state.file           = null;  // no local file for restored docs
+    state.chatHistory    = [];
+
+    // Enable chat since doc is already indexed in RAG
+    enableChat();
+
+    // Transition to workspace
+    showScreen('workspace');
+
+  } catch (e) {
+    if (cardEl) cardEl.classList.remove('restoring');
+    console.error('Failed to restore document:', e);
+    alert(`Failed to restore "${docName}": ${e.message}`);
+  }
+}
+
+async function deletePersistedDoc(docName, cardEl) {
+  try {
+    const r = await fetch(`${RAG_URL}/documents/${encodeURIComponent(docName)}`, {
+      method: 'DELETE',
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      throw new Error(`HTTP ${r.status}: ${errText.slice(0, 150)}`);
+    }
+
+    // Animate removal
+    if (cardEl) {
+      gsap.to(cardEl, {
+        opacity: 0,
+        height: 0,
+        padding: 0,
+        margin: 0,
+        duration: 0.3,
+        ease: 'power2.in',
+        onComplete: () => {
+          cardEl.remove();
+          // Show empty state if no cards left
+          const list = $('persisted-docs-list');
+          if (list && list.children.length === 0) {
+            $('persisted-docs-empty').style.display = 'block';
+          }
+        },
+      });
+    }
+
+    // Refresh RAG health badge
+    pingRAGHealth();
+
+  } catch (e) {
+    console.error('Failed to delete document:', e);
+    alert(`Failed to delete "${docName}": ${e.message}`);
+  }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -973,10 +1147,43 @@ function renderGraph(graphData, chunks) {
 
   // SVG dimensions
   const rect = container.getBoundingClientRect();
-  const width = rect.width;
-  const height = rect.height;
+  const width = rect.width || 800;
+  const height = rect.height || 600;
 
   svg.attr('viewBox', [0, 0, width, height]);
+
+  // Pre-position nodes by page in a neat grid to avoid overlapping and bursting
+  const pageSet = [...new Set(nodes.map(n => n.page_num || 1))].sort((a, b) => a - b);
+  const numPages = pageSet.length;
+  
+  // Decide grid columns and rows based on number of pages
+  const cols = Math.ceil(Math.sqrt(numPages));
+  const rows = Math.ceil(numPages / cols);
+  
+  const pageCenters = {};
+  pageSet.forEach((page, index) => {
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    const cx = numPages === 1 ? width / 2 : ((col + 0.5) / cols) * width;
+    const cy = numPages === 1 ? height / 2 : ((row + 0.5) / rows) * height;
+    pageCenters[page] = { x: cx, y: cy };
+  });
+
+  nodes.forEach(n => {
+    const pg = n.page_num || 1;
+    const center = pageCenters[pg] || { x: width / 2, y: height / 2 };
+    
+    if (n.type === 'page') {
+      n.x = center.x;
+      n.y = center.y;
+    } else {
+      // Scatter child nodes in a small circle around the page center
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 30 + Math.random() * 50;
+      n.x = center.x + Math.cos(angle) * radius;
+      n.y = center.y + Math.sin(angle) * radius;
+    }
+  });
 
   // Color scales
   const nodeColor = d => {
@@ -1017,7 +1224,14 @@ function renderGraph(graphData, chunks) {
     .force('charge', d3.forceManyBody().strength(-120))
     .force('center', d3.forceCenter(width / 2, height / 2))
     .force('collision', d3.forceCollide().radius(d => nodeRadius(d) + 5))
-    .alphaDecay(0.02);
+    .alphaDecay(nodes.length > 100 ? 0.04 : 0.02);
+
+  // Pre-tick the simulation to let nodes settle before rendering (prevents bursting)
+  const tickCount = Math.min(300, Math.max(150, Math.ceil(Math.log(nodes.length) * 40)));
+  simulation.stop();
+  for (let i = 0; i < tickCount; ++i) {
+    simulation.tick();
+  }
 
   state.graphSim = simulation;
 
@@ -1091,7 +1305,16 @@ function renderGraph(graphData, chunks) {
     highlightDocChunk(d.id);
   });
 
-  // Tick
+  // Set initial position of nodes and links from pre-ticked layout
+  link
+    .attr('x1', d => d.source.x)
+    .attr('y1', d => d.source.y)
+    .attr('x2', d => d.target.x)
+    .attr('y2', d => d.target.y);
+
+  node.attr('transform', d => `translate(${d.x},${d.y})`);
+
+  // Tick listener (for when simulation is restarted on drag)
   simulation.on('tick', () => {
     link
       .attr('x1', d => d.source.x)
@@ -1129,10 +1352,11 @@ function renderGraph(graphData, chunks) {
   });
 
   // Entrance animation — nodes fly in
+  const isLargeGraph = nodes.length > 50;
   gsap.from(node.nodes(), {
     attr: { opacity: 0 },
-    duration: 0.5,
-    stagger: 0.02,
+    duration: isLargeGraph ? 0.3 : 0.5,
+    stagger: isLargeGraph ? 0.002 : 0.02,
     ease: 'power2.out',
   });
 }
@@ -1448,4 +1672,5 @@ document.addEventListener('DOMContentLoaded', () => {
   pingHealth();
   pingRAGHealth();
   startKeepAlive();
+  loadPersistedDocs();
 });

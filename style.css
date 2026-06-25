@@ -1672,3 +1672,223 @@ html, body {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ══════════════════════════════════════════════════════════════════════
+   PERSISTED DOCUMENTS PANEL (ingest screen)
+══════════════════════════════════════════════════════════════════════ */
+.persisted-docs-panel {
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 20px;
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(10px);
+  animation: persistedFadeIn 0.5s ease-out;
+}
+
+@keyframes persistedFadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.persisted-docs-header {
+  margin-bottom: 16px;
+}
+
+.persisted-docs-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.persisted-docs-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.persisted-docs-subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+  display: block;
+  padding-left: 26px;
+}
+
+.persisted-docs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Individual persisted doc card */
+.persisted-doc-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: var(--card);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, transform 0.2s, box-shadow 0.2s;
+  animation: docCardSlideIn 0.35s ease-out both;
+}
+
+.persisted-doc-card:hover {
+  border-color: var(--border-hi);
+  background: rgba(255, 255, 255, 0.03);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+
+.persisted-doc-card.restoring {
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+@keyframes docCardSlideIn {
+  from { opacity: 0; transform: translateX(-12px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.persisted-doc-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--cyan-dim), var(--purple-dim));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--cyan);
+}
+
+.persisted-doc-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.persisted-doc-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.persisted-doc-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.persisted-doc-meta-sep {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.persisted-doc-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.persisted-doc-restore-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 14px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--cyan);
+  background: var(--cyan-dim);
+  color: var(--cyan);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s, box-shadow 0.2s;
+  white-space: nowrap;
+}
+
+.persisted-doc-restore-btn:hover {
+  background: rgba(0, 212, 170, 0.2);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 212, 170, 0.15);
+}
+
+.persisted-doc-delete-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s, background 0.2s;
+}
+
+.persisted-doc-delete-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--red-dim);
+}
+
+/* Empty and loading states */
+.persisted-docs-empty {
+  text-align: center;
+  padding: 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.persisted-docs-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.persisted-docs-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: step-spin 0.8s linear infinite;
+}
+
+/* Restore overlay on doc card */
+.persisted-doc-card .restore-loading {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--cyan);
+  font-weight: 500;
+}
+
+.persisted-doc-card.restoring .restore-loading {
+  display: flex;
+}
+
+.persisted-doc-card.restoring .persisted-doc-actions {
+  display: none;
+}
