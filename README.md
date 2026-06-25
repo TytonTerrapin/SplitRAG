@@ -1,418 +1,799 @@
-# Document Intelligence Pipeline — Architecture Reference
+# doc/intel — Architecture & Developer Reference
 
-A two-space, fully local document question-answering system. No OpenAI API calls.
-No GPU required. Designed to run on Hugging Face Spaces CPU tier.
-
----
-
-## System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          USER / CLIENT                                  │
-│                                                                         │
-│   Upload PDF ──► Space 1 /upload          Space 2 /query ◄── Question  │
-│                      │                         │                        │
-│                       ─────────── POST ──────►  │                       │
-│                        IngestPayload            │                       │
-│                                            RAGResponse                  │
-└─────────────────────────────────────────────────────────────────────────┘
-         │                                         │
-         ▼                                         ▼
-┌─────────────────┐                    ┌────────────────────┐
-│    SPACE 1      │  ──── HTTP ──────► │     SPACE 2        │
-│  OCR + Ingest   │   IngestPayload    │   RAG Backend      │
-│  port 7860      │                    │   port 7861        │
-└─────────────────┘                    └────────────────────┘
-```
+> **Two-Space document intelligence pipeline on HuggingFace.**  
+> Upload a PDF → OCR + graph extraction → vector index → RAG Q&A, all running on free CPU tiers.
 
 ---
 
-## Space 1 — OCR & Document Ingestion
+## Table of Contents
 
-**Stack:** FastAPI · PyMuPDF · pdfplumber · EasyOCR · OpenCV · NetworkX
+1. [System Overview](#1-system-overview)
+2. [Repository Layout](#2-repository-layout)
+3. [Data Flow](#3-data-flow)
+4. [Space 1 — OCR & Ingestion](#4-space-1--ocr--ingestion)
+   - 4.1 [Extraction Pipeline (three passes)](#41-extraction-pipeline-three-passes)
+   - 4.2 [OpenCV Preprocessing](#42-opencv-preprocessing)
+   - 4.3 [Chunking Strategy](#43-chunking-strategy)
+   - 4.4 [Document Graph](#44-document-graph)
+   - 4.5 [API Endpoints](#45-api-endpoints)
+   - 4.6 [Docker & Dependencies](#46-docker--dependencies)
+5. [Space 2 — RAG Backend](#5-space-2--rag-backend)
+   - 5.1 [Embedding](#51-embedding)
+   - 5.2 [Vector Store & Retrieval](#52-vector-store--retrieval)
+   - 5.3 [Generation](#53-generation)
+   - 5.4 [API Endpoints](#54-api-endpoints)
+   - 5.5 [Docker & Dependencies](#55-docker--dependencies)
+6. [Frontend](#6-frontend)
+   - 6.1 [Document Viewer](#61-document-viewer)
+   - 6.2 [Knowledge Graph (D3.js)](#62-knowledge-graph-d3js)
+   - 6.3 [RAG Chat Panel](#63-rag-chat-panel)
+7. [Shared Data Contract](#7-shared-data-contract)
+8. [Configuration Reference](#8-configuration-reference)
+9. [Known Limitations & Roadmap](#9-known-limitations--roadmap)
+10. [Deployment Checklist](#10-deployment-checklist)
 
-### Responsibility
+---
 
-Accepts a raw PDF, extracts structured content across three passes, builds
-a spatial document graph, chunks the content, and forwards the result to Space 2.
-
-### Extraction Pipeline (per page)
+## 1. System Overview
 
 ```
-PDF page
-   │
-   ├── Pass 1: PyMuPDF vector text extraction
-   │     Character-accurate, ~0.1s/page.
-   │     Classifies blocks as: title · paragraph · header · footer
-   │     Classification uses font size, boldness, position, word count.
-   │     Headers (top 55px) and footers (bottom of page) are tagged for skipping.
-   │
-   ├── Pass 2: Table extraction (pdfplumber → PyMuPDF fallback)
-   │     pdfplumber: ruled-line detection + whitespace column snapping.
-   │     Catches both bordered tables and borderless financial/data grids.
-   │     PyMuPDF find_tables() runs as fallback if pdfplumber finds nothing.
-   │     Text blocks overlapping a detected table bbox are suppressed
-   │     to prevent double-counting paragraph text inside table cells.
-   │     Output: HTML table (<table><th><td>) + plain-text representation.
-   │
-   └── Pass 3: Embedded image / figure OCR (PyMuPDF + OpenCV + EasyOCR)
-         PyMuPDF extracts each embedded image as a numpy array.
-         OpenCV preprocessing: deskew (Hough line rotation correction) +
-         CLAHE contrast normalisation. Both are cheap (~30ms/page) and
-         reliably help scanned or photographed inserts.
-         EasyOCR reads chart labels, captions embedded in images, scanned
-         inserts. Lazy-loaded singleton — 3s load cost paid once.
-         Output: figure block with OCR'd text + image bytes in metadata.
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Browser / Client                            │
+│                                                                     │
+│  ┌──────────────┐   ┌──────────────────┐   ┌────────────────────┐  │
+│  │ Doc Viewer   │   │ Knowledge Graph  │   │  RAG Chat Panel    │  │
+│  │ (page imgs)  │   │  (D3.js force)   │   │  (SSE streaming)   │  │
+│  └──────┬───────┘   └────────┬─────────┘   └────────┬───────────┘  │
+│         │                    │                       │              │
+└─────────┼────────────────────┼───────────────────────┼─────────────┘
+          │  POST /ingest      │  GET /documents/{n}   │  POST /query
+          ▼                    ▼                       ▼
+┌─────────────────────┐               ┌──────────────────────────────┐
+│   Space 1           │               │   Space 2                    │
+│   doc-ingestion     │──────────────▶│   doc-rag                    │
+│   :7860             │  POST /extract│   :7861                      │
+│                     │  (IngestPayload)                             │
+│  PyMuPDF            │               │  BGE-base-en-v1.5 (ONNX)    │
+│  pdfplumber         │               │  FAISS IndexFlatIP           │
+│  EasyOCR            │               │  Qwen2.5-3B-Instruct Q4_K_M  │
+│  OpenCV             │               │  NetworkX graph re-ranking   │
+│  NetworkX           │               │                              │
+└─────────────────────┘               └──────────────────────────────┘
+          │                                           │
+          └──────────── HF Datasets repo ─────────────┘
+                    (persistent /data volume)
 ```
 
-### OpenCV Preprocessing (configurable)
+**Key design decisions:**
 
-| Step | Default | Notes |
+| Decision | Rationale |
+|---|---|
+| Two separate Spaces | Isolation: OCR is CPU-bound and memory-heavy (EasyOCR + OpenCV). Embedding + LLM inference runs independently and can restart without re-ingesting documents. |
+| Free CPU tier only | No GPU available. All models chosen for CPU viability: ONNX embedding (~30ms/chunk), GGUF Q4 inference (~8 tok/s). |
+| FAISS IndexFlatIP | Exact inner-product search. No approximation error, sufficient for document-scale (<10k chunks). |
+| Persistent `/data` volume | HF Spaces free tier loses RAM on sleep. FAISS index + metadata pickled to `/data` so documents survive restarts without re-ingestion. |
+| Async job queue | HF proxy times out at ~120s. `/ingest` and `/query` use job IDs + polling so the browser never hits a gateway timeout. |
+
+---
+
+## 2. Repository Layout
+
+```
+doc-intel/
+├── space1/                     # HuggingFace Space: doc-ingestion
+│   ├── main.py                 # FastAPI app — all endpoints
+│   ├── ocr_engine.py           # Three-pass extraction (PyMuPDF + pdfplumber + EasyOCR)
+│   ├── ocv_pipeline.py         # OpenCV preprocessing (deskew, CLAHE)
+│   ├── pdf_to_images.py        # PDF → numpy page arrays via PyMuPDF
+│   ├── chunker.py              # Sentence-boundary chunking with context carry-forward
+│   ├── graph_builder.py        # NetworkX DiGraph (hierarchy + reading_order + spatial)
+│   ├── serialiser.py           # Packages payload for Space 2
+│   ├── client.py               # HTTP client to Space 2 with wake-ping + retry
+│   ├── models.py               # Chunk dataclass (shared schema)
+│   ├── config.py               # All tunables — overridable via HF env vars
+│   ├── download_models.py      # Pre-downloads EasyOCR weights at build time
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── README.md
+│
+├── space2/                     # HuggingFace Space: doc-rag
+│   ├── main.py                 # FastAPI app — all endpoints
+│   ├── embedder.py             # BGE-base-en-v1.5 via onnxruntime (no torch)
+│   ├── generator.py            # Qwen2.5-3B-Instruct-Q4_K_M via llama-cpp-python
+│   ├── retriever.py            # FAISS search + spatial re-ranking + section boost
+│   ├── store.py                # DocumentStore: FAISS index + graph + persistence
+│   ├── models.py               # Pydantic schemas (IngestPayload, QueryRequest, ...)
+│   ├── config.py               # All tunables — overridable via HF env vars
+│   ├── download_models.py      # Pre-downloads GGUF + BGE ONNX at build time
+│   ├── requirements.txt
+│   └── Dockerfile
+│
+└── frontend/                   # Vanilla HTML/CSS/JS (served statically or embedded)
+    ├── index.html
+    ├── style.css
+    └── app.js                  # D3.js force graph + SSE streaming + fetch wrappers
+```
+
+---
+
+## 3. Data Flow
+
+### Upload → Ingest → Index
+
+```
+User uploads PDF
+      │
+      ▼
+Space 1: POST /ingest
+      │
+      ├─► pdf_to_images.load_pages()
+      │       PyMuPDF renders PDF → list of BGR numpy arrays @ 300 DPI
+      │
+      ├─► ocv_pipeline.preprocess_pages()
+      │       deskew (minAreaRect) → CLAHE contrast normalisation
+      │
+      ├─► ocr_engine.run_ocr()
+      │       Pass 1: PyMuPDF vector text  (instant, character-accurate)
+      │       Pass 2: pdfplumber tables    (ruled + borderless detection)
+      │              └─ fallback: fitz.find_tables()
+      │       Pass 3: EasyOCR on embedded images (figures, scanned inserts)
+      │       → List[page_dict]  (parsing_blocks per page)
+      │
+      ├─► chunker.chunk_document()
+      │       Sentence-boundary split → context carry-forward → title absorption
+      │       → List[Chunk]
+      │
+      ├─► graph_builder.build_graph()
+      │       hierarchy edges  (page → region)
+      │       reading_order edges (region → next region)
+      │       spatial edges   (region ↔ nearby region, weight = 1 - dist/threshold)
+      │       → nx.DiGraph
+      │
+      ├─► serialiser.build_payload()
+      │       → IngestPayload dict  (doc_name, total_pages, graph, reading_order, chunks)
+      │
+      └─► client.extract()  ──────────────────────────────────────────────────▶
+                                                                    Space 2: POST /extract
+                                                                          │
+                                                                          ├─► embedder.encode_chunks()
+                                                                          │       BGE-base ONNX
+                                                                          │       batched mean-pool
+                                                                          │       L2-normalise
+                                                                          │
+                                                                          ├─► store.add_document()
+                                                                          │       FAISS IndexFlatIP.add()
+                                                                          │       build chunk→node map
+                                                                          │       pickle to /data
+                                                                          │
+                                                                          └─► IngestResponse  ◀────────
+```
+
+### Query → Retrieve → Generate
+
+```
+User types question
+      │
+      ▼
+Space 2: POST /query  (or /query/async, /query/stream)
+      │
+      ├─► embedder.encode_query()
+      │       prepend BGE query prefix → ONNX → L2-normalise
+      │
+      ├─► store.search()
+      │       FAISS.search(query_vec, top_k=20)
+      │       → List[(Chunk, cosine_score)]
+      │
+      ├─► retriever.retrieve()
+      │       _spatial_rerank()    boost chunks whose graph neighbours also scored
+      │       _section_boost()     bonus for early pages, intro/abstract keywords
+      │       _deduplicate()       collapse same page + same leading 80 chars
+      │       → top 5 RetrievedChunk
+      │
+      ├─► generator.generate()
+      │       _build_context()     sort by (doc, page), use table_html for tables
+      │       Qwen2.5-3B chat completion (llama-cpp-python)
+      │       ThreadPoolExecutor timeout = 110s safety net
+      │       → answer string
+      │
+      └─► RAGResponse  { question, answer, retrieved_chunks, doc_names_searched }
+```
+
+---
+
+## 4. Space 1 — OCR & Ingestion
+
+**HuggingFace Space:** `TytonTerrapin/doc-ingestion`  
+**Port:** `7860`  
+**Base image:** `python:3.10-slim`
+
+### 4.1 Extraction Pipeline (three passes)
+
+The pipeline runs three complementary passes per page so each content type is handled by the tool best suited to it:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Page image (300 DPI numpy array)                           │
+│                                                             │
+│  Pass 1 — PyMuPDF vector text                               │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ fitz.get_text("dict")                                │   │
+│  │ classify: title / text / header / footer             │   │
+│  │ suppress blocks overlapping detected table bboxes    │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Pass 2 — Table detection                                   │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ pdfplumber.extract_tables()   (primary)              │   │
+│  │   ruled lines + whitespace-column snapping           │   │
+│  │ fitz.find_tables()            (fallback if pp=0)     │   │
+│  │ deduplicate by IoU > 0.5                             │   │
+│  │ emit: block_content (plain text) + block_html        │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Pass 3 — Embedded images / figures                         │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ fitz.get_images() → extract_image() → numpy array   │   │
+│  │ skip < 50×50 px (icons / decorative)                 │   │
+│  │ OCV preprocessing → EasyOCR.readtext()               │   │
+│  │ bbox from fitz.get_image_info()                      │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                             │
+│  Merge all blocks → sort by (y, x) → page_dict             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Title classifier heuristic** (in `_classify_text_block`):
+
+| Condition | Label |
+|---|---|
+| ≤ 10 words AND `bbox.y1 < 55 pt` | `header` |
+| ≤ 10 words AND `bbox.y2 > 770 pt` | `footer` |
+| ≥ 40% of lines match TOC dot-leader regex | `text` (suppress) |
+| `len(text) < 4` | `text` |
+| ≤ 15 words AND (`avg_font_size ≥ 13` OR `bold`) | `title` |
+| else | `text` |
+
+> **Note:** coordinates from `fitz.get_text("dict")` are in PDF points (72 dpi space), so the pixel thresholds above are correct for that coordinate system — not for the 300 DPI rasterised image.
+
+### 4.2 OpenCV Preprocessing
+
+Default chain (both flags `True` in `config.py`):
+
+```
+Input BGR array
+      │
+      ▼  CV_ENABLE_DESKEW = True
+   deskew()
+   GaussianBlur → Otsu → findNonZero → minAreaRect
+   skip if |angle| < 0.3° (sub-degree not worth warp blur)
+      │
+      ▼  CV_ENABLE_CLAHE = True
+   clahe_contrast()
+   BGR → LAB → CLAHE on L channel (clipLimit=2.0, tile=8×8) → BGR
+      │
+      ▼
+   Preprocessed BGR array
+```
+
+Optional (disabled by default):
+
+| Flag | Function | Notes |
 |---|---|---|
-| Deskew | ON | Hough line detection, corrects rotated scans |
-| CLAHE | ON | Contrast normalisation, helps low-contrast docs |
-| Denoise | OFF | `fastNlMeansDenoising` — slow (1-3s/page), rarely needed |
-| Binarize | OFF | Otsu threshold — hurts learned OCR models like EasyOCR |
+| `CV_ENABLE_DENOISE` | `bilateralFilter(d=5)` | Use for genuine fax-quality scans. ~100ms/page. Full NLM is commented-out alternative (~2s/page). |
+| `CV_ENABLE_BINARIZE` | Otsu thresholding | Hurts deep-model OCR on normal PDFs. Only enable for severely degraded scans. |
 
-### Chunking (`chunker.py`)
+### 4.3 Chunking Strategy
 
-```
-parsing_blocks (per page, sorted top→bottom left→right)
-   │
-   ├── Noise filter
-   │     Skip: bbox width < 15px (watermarks, binding marks)
-   │     Skip: known artifact strings (ISO DRM watermarks)
-   │     Skip: bare URLs, DOIs, publisher branding, copyright lines,
-   │           page numbers, email-only lines, citation instructions
-   │
-   ├── TOC page detection
-   │     Pages with ≥3 dot-leader lines skipped wholesale
-   │
-   ├── Title buffering
-   │     Consecutive title blocks merged into one heading
-   │     (handles multi-line page-wrapped titles)
-   │     Becomes section_title for all following chunks
-   │
-   ├── Block merging (paragraph accumulator)
-   │     Adjacent paragraph blocks under the same section are
-   │     accumulated before splitting. Prevents micro-chunks from
-   │     multi-column PDF layout (academic papers, reports).
-   │     Flush when: section changes, non-paragraph block encountered,
-   │     or accumulated word count ≥ CHUNK_TOKEN_LIMIT.
-   │
-   ├── Sliding window split
-   │     CHUNK_TOKEN_LIMIT = 512 words, CHUNK_OVERLAP = 64 words
-   │     Applied to merged block text, not individual tiny blocks
-   │
-   ├── Section title prepended to each chunk text
-   │     "2. Materials and Methods\nThe methodology used..."
-   │     Improves embedding quality — model sees topic + content together
-   │
-   ├── Tables → single chunk, never split, HTML preserved
-   └── Figures → stub chunk emitted (preserves position even without caption)
-```
-
-### Spatial Document Graph (`graph_builder.py`)
-
-A `networkx.DiGraph` is built alongside chunks, encoding document structure:
+`chunker.py` implements five techniques layered on top of each other:
 
 ```
-Node types:
-  document   — root node, one per doc
-  page       — one per page, child of document
-  region     — one per parsed block (paragraph, table, figure, title)
-               stores: block_content, block_label, page_num, block_bbox
-
-Edge types:
-  contains   — document→page, page→region (structural hierarchy)
-  reading    — region→region in reading order (left→right, top→bottom)
-  spatial    — region→region for blocks within PROXIMITY_THRESHOLD pixels
-               weight = 1 / (1 + pixel_distance)
-               captures: table↔caption, figure↔label, adjacent paragraphs
+Raw parsing_blocks (per page)
+      │
+      ▼  1. TOC page filter
+   Skip pages with ≥ 3 dot-leader blocks
+      │
+      ▼  2. Noise filter
+   Skip: bbox width < 15px, DOIs, bare URLs, page numbers,
+         publisher metadata, copyright lines
+      │
+      ▼  3. Block merging
+   Adjacent paragraph blocks accumulated in para_buffer
+   Flush when word count ≥ MERGE_TARGET_WORDS (200)
+   or when a title / table / figure is encountered
+      │
+      ▼  4. Title absorption
+   Titles are NOT emitted as standalone chunks.
+   Instead, the title text is prepended to the first
+   paragraph chunk that follows it.
+   → Eliminates content-free title slots in top-k retrieval.
+      │
+      ▼  5. Sentence-boundary split + sentence-aligned overlap
+   _split_sentences_into_chunks(text, limit=512, overlap=64)
+   Sentences identified by:  (?<=[.!?])\s+(?=[A-Z\"'])
+   Overlap = last complete sentence(s) from previous chunk
+   that fit within OVERLAP_WORDS (64).
+      │
+      ▼  6. Context carry-forward (contextual retrieval)
+   Each chunk prefixed with:
+   [Context: <first sentence of previous chunk>]
+   ~15-25 extra tokens; significantly improves mid-document
+   retrieval for questions without explicit section references.
+      │
+      ▼
+   List[Chunk]
+   Tables: always atomic (never split), carry table_html
+   Figures: stub chunk with EasyOCR text as content
 ```
 
-The graph travels with the chunks in `IngestPayload` as node-link JSON.
+### 4.4 Document Graph
 
-### IngestPayload (Space 1 → Space 2)
+`graph_builder.py` builds a `nx.DiGraph` with three edge types:
+
+```
+page_1  ──(hierarchy)──▶  page1_block0
+                          page1_block1
+                          page1_block2
+                               │
+        page1_block0 ──(reading_order)──▶ page1_block1
+        page1_block1 ──(reading_order)──▶ page1_block2
+                               │
+        page1_block0 ◀──(spatial)──▶ page1_block1
+              weight = 1 - dist/PROXIMITY_THRESHOLD (150px)
+```
+
+**Node attributes:**
 
 ```json
 {
-  "doc_name": "wind_energy_paper.pdf",
-  "total_pages": 14,
-  "chunks": [...],          // List[ChunkSchema]
-  "graph": {...},           // networkx node-link JSON
-  "reading_order": [...]    // ordered list of chunk_ids
+  "node_type": "region",
+  "page_num": 3,
+  "block_label": "title",
+  "block_bbox": [72.0, 120.5, 540.0, 145.0],
+  "block_content": "4.3 Modified search strategy"
 }
 ```
 
-### Space 1 Endpoints
+> **Known limitation:** reading order is top-to-bottom, left-to-right only. Multi-column layouts (two columns) will read across both columns incorrectly. Column detection (clustering x-centroids) is the fix and is on the roadmap.
+
+### 4.5 API Endpoints
+
+Base URL: `https://tytonterrapin-doc-ingestion.hf.space`
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/upload` | Accept PDF, run full pipeline, forward to Space 2 |
-| GET | `/health` | Liveness + OCR engine readiness |
-| GET | `/docs` | Swagger UI |
+| `GET` | `/health` | Liveness check. Returns uptime, Space 2 connectivity. |
+| `GET` | `/schema` | JSON Schema of the IngestPayload contract. |
+| `POST` | `/pages` | Load + preprocess only → page count + dimensions. No OCR. |
+| `POST` | `/ocr` | Load → preprocess → OCR → raw `parsing_blocks` per page. |
+| `POST` | `/graph` | Full pipeline to graph → serialised DiGraph + reading order. |
+| `POST` | `/chunks` | Full pipeline → flat chunk list only (lighter payload). |
+| `POST` | `/ingest` | **Full pipeline → IngestPayload JSON.** Primary endpoint. |
+| `POST` | `/ingest/forward` | Full pipeline → forward to Space 2 `/extract` → return result. |
+
+All file-upload endpoints accept `multipart/form-data` with field name `file`.  
+Supported types: `.pdf .png .jpg .jpeg .tif .tiff .bmp .webp`
+
+**Example — ingest a PDF and pipe to Space 2:**
+
+```bash
+curl -X POST https://tytonterrapin-doc-ingestion.hf.space/ingest \
+     -F "file=@paper.pdf" \
+  | curl -X POST https://tytonterrapin-doc-rag.hf.space/extract \
+         -H "Content-Type: application/json" \
+         -d @-
+```
+
+### 4.6 Docker & Dependencies
+
+```dockerfile
+FROM python:3.10-slim
+# libgl1 + libglib2.0-0 required by opencv-python-headless
+# libgomp1 required by faiss-cpu
+RUN apt-get install -y libgl1 libglib2.0-0 libgomp1
+
+ENV EASYOCR_MODULE_PATH=/home/user/.EasyOCR
+# EasyOCR weights pre-downloaded at build time via download_models.py
+# Workers = 1: EasyOCR singleton reader is not fork-safe
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "1"]
+```
+
+**Key packages:**
+
+| Package | Version | Purpose |
+|---|---|---|
+| `PyMuPDF` | ≥ 1.24 | PDF rendering + vector text + table detection + image extraction |
+| `pdfplumber` | ≥ 0.11 | Primary table extractor (ruled + borderless) |
+| `opencv-python-headless` | ≥ 4.9 | Deskew, CLAHE, bilateral filter |
+| `easyocr` | ≥ 1.7 | Figure / embedded image OCR |
+| `networkx` | ≥ 3.2 | Document graph construction |
+| `httpx` | ≥ 0.27 | Async HTTP client to Space 2 |
+| `fastapi` + `uvicorn` | ≥ 0.111 | API server |
 
 ---
 
-## Space 2 — RAG Backend
+## 5. Space 2 — RAG Backend
 
-**Stack:** FastAPI · FAISS · BGE-small-en-v1.5 (ONNX) · Qwen2.5-3B-Q4 (llama-cpp) · NetworkX
+**HuggingFace Space:** `TytonTerrapin/doc-rag`  
+**Port:** `7861`  
+**Base image:** `python:3.11-slim`
 
-### Responsibility
+### 5.1 Embedding
 
-Receives ingested document payloads, builds an in-memory vector index,
-serves retrieval-augmented generation queries.
-
-### Startup Sequence
-
-```
-Container start
-   │
-   ├── Embedder.load()
-   │     Load BGE-small-en-v1.5 from ONNX (pre-built Xenova weights)
-   │     Pure onnxruntime — zero torch/CUDA dependency
-   │     ~0.4s load time
-   │
-   └── Generator.load()
-         Load Qwen2.5-3B-Instruct-Q4_K_M via llama-cpp
-         GGUF baked into Docker image at build time
-         ~0.6s load time (already on disk, no network call)
-```
-
-### Ingest Flow (`POST /ingest`)
+**Model:** `BAAI/bge-base-en-v1.5` — 768-dimensional, loaded via pure `onnxruntime` (no PyTorch, no `optimum`).  
+**Source:** `Xenova/bge-base-en-v1.5` ONNX export (downloaded at build time).
 
 ```
-IngestPayload arrives
-   │
-   ├── Fallback: if chunks == [] (Space 1 chunker failure)
-   │     Synthesize chunks from graph region nodes directly
-   │     Apply: noise filter, OCR spacing fix, min word count,
-   │            figure skip, section title prefix
-   │
-   ├── embedder.encode_chunks(texts)
-   │     BGE-small-en-v1.5 via onnxruntime
-   │     Batch size 64, max 512 tokens per chunk
-   │     No query prefix for passage encoding
-   │     Mean pooling over token dimension
-   │     Output: float32 array (n_chunks, 384)
-   │
-   ├── L2-normalise embeddings
-   │     Enables cosine similarity via inner product (IndexFlatIP)
-   │
-   ├── faiss.IndexFlatIP.add(normed_embeddings)
-   │     Exact search, no approximation
-   │     Per-document index stored in DocumentStore
-   │
-   └── networkx.DiGraph stored alongside index
-         Deserialized from node-link JSON
-         Used by spatial reranker at query time
+Input text(s)
+      │
+      ▼
+AutoTokenizer (from ONNX dir, fast tokenizer)
+padding=True, truncation=True, max_length=512
+      │
+      ▼
+onnxruntime.InferenceSession  (CPUExecutionProvider)
+intra_op_threads=2, inter_op_threads=2
+      │
+      ▼
+token embeddings  (batch, seq_len, 768)
+      │
+      ▼  mean pool over attention mask
+sentence embedding  (batch, 768)  float32
+      │
+      ▼  L2 normalise  (for inner-product = cosine)
+normalised embedding  (batch, 768)
 ```
 
-### Query Flow (`POST /query`)
+**Query encoding:** BGE asymmetric retrieval — queries are prefixed with  
+`"Represent this sentence: "` before encoding. Chunk encoding has no prefix.
+
+### 5.2 Vector Store & Retrieval
+
+**`store.py` — DocumentStore**
 
 ```
-Question string
-   │
-   ├── embedder.encode_query(question)
-   │     Prefix: "Represent this sentence: " + question
-   │     (BGE instruction-following convention for retrieval queries)
-   │     L2-normalise
-   │
-   ├── FAISS search
-   │     IndexFlatIP.search(query_vec, FAISS_TOP_K=10)
-   │     Returns cosine similarity scores + chunk indices
-   │     Optionally scoped to a single doc_name
-   │
-   ├── Spatial graph re-ranking
-   │     For each FAISS candidate:
-   │       Strip section-title prefix to get raw block text
-   │       Find matching region node in DiGraph by page + text snippet
-   │       Walk one-hop spatial edges
-   │       If a spatial neighbour is also in the candidate set:
-   │         boost_i += SPATIAL_RERANK_ALPHA × edge_weight (default 0.15)
-   │         boost_j += SPATIAL_RERANK_ALPHA × edge_weight (symmetric)
-   │     Intuition: a table and its caption should rank together
-   │     Sort by boosted score descending
-   │
-   ├── Trim to RETRIEVAL_TOP_K=5 chunks
-   │
-   └── Generator.generate(question, chunks)
-         Build prompt:
-           system: grounded QA instruction
-           user:   numbered context passages + question
-                   Each passage: [N] doc | p.X | Section Title\n<text>
-                   Section title prefix stripped from text body
-                   (was added for embedding, shown in header instead)
-         Qwen2.5-3B-Instruct-Q4_K_M via create_chat_completion()
-         max_tokens=768, temperature=0.2, top_p=0.9
-         Returns: RAGResponse { answer, retrieved_chunks, docs_searched }
+add_document(doc_name, chunks, graph_data, reading_order, embeddings)
+      │
+      ├─► L2-normalise embeddings
+      ├─► faiss.IndexFlatIP(768).add(normed)   — exact cosine search
+      ├─► json_graph.node_link_graph(graph_data)
+      ├─► _build_chunk_node_map()              — O(n) at ingest, O(1) at query
+      └─► _persist()                            — pickle to /data/<doc_name>/
+            meta.pkl  (chunks, graph, reading_order, id_map, chunk_to_node)
+            index.faiss
+            embeddings.npy
 ```
 
-### Embedding Model
+**`retriever.py` — three-stage pipeline**
 
-| Property | Value |
+```
+FAISS search (top_k=20 candidates)
+      │
+      ▼  _spatial_rerank()
+   For each candidate, look up its graph node (O(1) via chunk_to_node map).
+   Walk one-hop spatial edges. If a neighbour is also a candidate,
+   both scores get:  boost += SPATIAL_RERANK_ALPHA × edge_weight  (α=0.15)
+      │
+      ▼  _section_boost()
+   Bonus scores for chunks likely to answer high-level questions:
+   • early page (page ≤ 3):           +0.15 × 0.6
+   • section_title matches intro keywords: +0.15 × 0.8
+   • region_type in {title,abstract,heading}: +0.15 × 0.4
+   • text snippet matches intro keywords:  +0.15 × 0.3
+      │
+      ▼  _deduplicate()
+   Collapse chunks with same (page_num, text[:80]).
+   Prevents same passage appearing multiple times in top-k.
+      │
+      ▼
+   top 5 RetrievedChunk  (score = cosine + spatial boost + section boost)
+```
+
+### 5.3 Generation
+
+**Model:** `Qwen/Qwen2.5-3B-Instruct-GGUF` — `qwen2.5-3b-instruct-q4_k_m.gguf` (~1.9 GB)  
+**Runtime:** `llama-cpp-python==0.2.90`, CPU-only, `n_gpu_layers=0`
+
+**Context builder** (`_build_context` in `generator.py`):
+
+```python
+# Chunks sorted by (doc_name, page_num) for coherent reading order
+for chunk in sorted_chunks:
+    header = f"[{i}] {doc_name} | p.{page_num} | {section_title} | {region_type}"
+
+    if chunk.table_html:
+        text = chunk.table_html          # structured HTML for tables
+    else:
+        text = chunk.text[:800] + "…"   # 800 char cap for paragraphs
+```
+
+**Timing budget** on Qwen2.5-3B-Q4 at ~8 tok/s:
+
+| Phase | Time |
 |---|---|
-| Model | BAAI/bge-small-en-v1.5 |
-| Source | Xenova/bge-small-en-v1.5 (pre-built ONNX) |
-| Runtime | onnxruntime CPUExecutionProvider |
-| Dimension | 384 |
-| Max tokens | 512 |
-| Query prefix | "Represent this sentence: " |
-| Passage prefix | none |
+| Prefill (~800 prompt tokens) | ~2s |
+| Generation (400 output tokens) | ~50s |
+| Total | ~52s |
+| ThreadPoolExecutor safety timeout | 110s |
 
-### Generation Model
+**SIGALRM handling:** llama-cpp sets a SIGALRM watchdog at model load time. `signal.signal(SIGALRM, SIG_IGN)` is called once in `Generator.load()` — which runs in the lifespan startup (main thread). Worker threads cannot call `signal.signal()`, hence the `ThreadPoolExecutor` wrapping `generate()` for a wall-clock timeout without touching signals.
 
-| Property | Value |
-|---|---|
-| Model | Qwen2.5-3B-Instruct |
-| Quantization | Q4_K_M (GGUF) |
-| Runtime | llama-cpp-python (compiled for glibc/Debian) |
-| Context window | 8192 tokens |
-| Max output | 768 tokens |
-| Temperature | 0.2 |
-| GPU layers | 0 (CPU-only) |
-| Threads | 4 |
+### 5.4 API Endpoints
 
-### In-Memory Document Store (`store.py`)
-
-```
-DocumentStore
-  └── _docs: Dict[str, DocIndex]
-        └── DocIndex
-              ├── chunks: List[ChunkSchema]
-              ├── graph: nx.DiGraph
-              ├── reading_order: List[str]
-              ├── faiss_index: IndexFlatIP
-              └── id_map: List[str]   (FAISS row → chunk_id)
-```
-
-State is lost on process restart by design. Re-ingest to repopulate.
-Swap `_docs` for sqlite + persisted FAISS index for durability.
-
-### Space 2 Endpoints
+Base URL: `https://tytonterrapin-doc-rag.hf.space`
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/ingest` | Receive IngestPayload, embed, index |
-| POST | `/extract` | Alias for `/ingest` (Space 1 client compatibility) |
-| POST | `/query` | RAG: retrieve + generate |
-| GET | `/health` | Liveness + embedder/LLM readiness + doc count |
-| GET | `/docs` | Swagger UI |
+| `GET` | `/health` | Returns `{status, docs_ingested, embedder_ready, llm_ready}` |
+| `POST` | `/ingest` | Receive IngestPayload, embed chunks, add to FAISS. |
+| `POST` | `/extract` | Alias for `/ingest` (called by Space 1's `client.py`). |
+| `POST` | `/query` | Synchronous RAG: embed → retrieve → generate → RAGResponse. |
+| `POST` | `/query/async` | Async RAG: generation runs in thread pool, event loop free. |
+| `POST` | `/query/stream` | Streaming RAG: SSE tokens as they arrive. |
+| `GET` | `/documents` | List ingested documents with chunk counts. |
+| `GET` | `/documents/{doc_name}/detail` | Full document payload for frontend restore. |
+| `DELETE` | `/documents/{doc_name}` | Remove from memory + disk. |
 
----
-
-## End-to-End Data Flow
-
-```
-PDF file
-  │
-  │  Space 1
-  ├─[PyMuPDF]──────────► vector text blocks
-  ├─[pdfplumber]────────► table blocks (HTML + text)
-  ├─[EasyOCR]───────────► figure blocks (OCR'd caption text)
-  │
-  ├─[ocv_pipeline]──────► deskew + CLAHE per page image
-  │
-  ├─[chunker]───────────► noise filter → merge → split → prefix
-  │                        List[Chunk] (section_title prepended)
-  │
-  ├─[graph_builder]─────► nx.DiGraph
-  │                        nodes: document / page / region
-  │                        edges: contains / reading / spatial
-  │
-  └─[client.py]─────────► POST /ingest → Space 2
-                           IngestPayload {chunks, graph, reading_order}
-
-  │  Space 2
-  ├─[embedder]──────────► BGE-small ONNX → (n, 384) float32
-  ├─[store]─────────────► L2-norm → FAISS IndexFlatIP + DiGraph in RAM
-  │
-  │  [query time]
-  ├─[embedder]──────────► encode query → (384,) float32
-  ├─[FAISS]─────────────► top-10 cosine candidates
-  ├─[retriever]─────────► spatial graph boost → top-5
-  └─[generator]─────────► Qwen2.5-3B prompt → answer string
-```
-
----
-
-## Configuration Reference
-
-### Space 1
-
-| Variable | Default | Description |
-|---|---|---|
-| `SPACE2_URL` | `""` | Space 2 base URL for forwarding payloads |
-| `SPACE2_REQUEST_TIMEOUT_S` | `120` | Timeout for ingest POST to Space 2 |
-| `PDF_RENDER_DPI` | `300` | Page rasterisation DPI for image passes |
-| `CV_ENABLE_DESKEW` | `true` | OpenCV deskew correction |
-| `CV_ENABLE_CLAHE` | `true` | CLAHE contrast normalisation |
-| `CV_ENABLE_DENOISE` | `false` | Slow — enable only for scanned docs |
-| `CV_ENABLE_BINARIZE` | `false` | Otsu threshold — hurts learned OCR |
-| `OCR_LIGHTWEIGHT` | `true` | Use lightweight PPStructure models |
-| `OCR_CPU_THREADS` | `4` | PaddleOCR CPU thread count |
-| `CHUNK_TOKEN_LIMIT` | `512` | Max words per chunk after merge |
-| `CHUNK_OVERLAP` | `64` | Sliding window overlap in words |
-| `PROXIMITY_THRESHOLD` | `150` | Max pixel distance for spatial graph edges |
-
-### Space 2
-
-| Variable | Default | Description |
-|---|---|---|
-| `EMBED_MODEL_NAME` | `BAAI/bge-small-en-v1.5` | HF model id (informational) |
-| `EMBED_ONNX_DIR` | `./models/bge-small-onnx` | Path to Xenova ONNX weights |
-| `EMBED_DIM` | `384` | Embedding dimension |
-| `FAISS_TOP_K` | `10` | Candidates retrieved before re-ranking |
-| `RETRIEVAL_TOP_K` | `5` | Final chunks passed to LLM |
-| `SPATIAL_RERANK_ALPHA` | `0.15` | Spatial edge boost weight |
-| `LLM_CONTEXT_LENGTH` | `8192` | Qwen2.5 context window (tokens) |
-| `LLM_MAX_TOKENS` | `768` | Max generated tokens per answer |
-| `LLM_TEMPERATURE` | `0.2` | Generation temperature |
-| `LLM_N_THREADS` | `4` | llama-cpp CPU thread count |
-
----
-
-## Local Development
+**Query example:**
 
 ```bash
-# Terminal 1 — Space 1
-cd space1
-pip install -r requirements.txt
-uvicorn main:app --port 7860 --reload
-
-# Terminal 2 — Space 2
-cd space2
-pip install -r requirements.txt
-python download_models.py        # one-time: GGUF + BGE-small ONNX
-uvicorn main:app --port 7861 --reload
-
-# Set Space 1 to forward to local Space 2
-export SPACE2_URL=http://localhost:7861
-```
-
-```bash
-# Upload a PDF
-curl -X POST http://localhost:7860/upload \
-     -F "file=@paper.pdf"
-
-# Query
-curl -X POST http://localhost:7861/query \
+curl -X POST https://tytonterrapin-doc-rag.hf.space/query \
      -H "Content-Type: application/json" \
-     -d '{"question": "What is the main finding?", "doc_name": "paper.pdf"}'
+     -d '{"question": "What is the objective of this paper?", "doc_name": "paper", "top_k": 5}'
+```
 
-# Health check
-curl http://localhost:7861/health
+**SSE streaming example (`/query/stream`):**
+
+```
+data: {"type": "chunks", "chunks": [{"chunk_id": "a3f2", "page": 3, ...}]}
+
+data: {"type": "token", "text": "The paper introduces"}
+data: {"type": "token", "text": " a modified Firefly"}
+...
+data: [DONE]
+```
+
+### 5.5 Docker & Dependencies
+
+```dockerfile
+FROM python:3.11-slim
+# llama-cpp compiled from source (CPU-only, no CUDA search)
+ENV CMAKE_ARGS="-DGGML_NATIVE=OFF"
+ENV EMBED_ONNX_DIR=/app/models/bge-base-onnx
+# Models pre-downloaded at build time (~2.2 GB total)
+# BGE-base ONNX: ~270 MB   Qwen2.5-3B Q4_K_M GGUF: ~1.9 GB
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7861"]
+```
+
+**Key packages:**
+
+| Package | Version | Purpose |
+|---|---|---|
+| `onnxruntime` | ≥ 1.18 | BGE embedding inference (no torch) |
+| `transformers` | ≥ 4.34 | BGE tokenizer only |
+| `faiss-cpu` | ≥ 1.8 | Exact inner-product vector search |
+| `llama-cpp-python` | 0.2.90 | Qwen2.5-3B GGUF inference |
+| `networkx` | ≥ 3.2 | Graph storage + spatial re-ranking |
+| `fastapi` + `uvicorn` | ≥ 0.111 | API server |
+| `huggingface-hub` | ≥ 0.23 | Model downloads at build time |
+
+---
+
+## 6. Frontend
+
+The frontend is a single-page application with three panels, communicating directly with Space 1 and Space 2.
+
+### 6.1 Document Viewer
+
+- Displays rendered page images (fetched from Space 1 after ingest)
+- Highlights the **bounding boxes** of retrieved chunks when a RAG answer arrives
+- "Restore" button calls `GET /documents/{doc_name}/detail` on Space 2 to reload the workspace after a page refresh without re-uploading
+
+### 6.2 Knowledge Graph (D3.js)
+
+The graph panel renders the `nx.DiGraph` from the ingest payload as an interactive force-directed graph using **D3.js v7**.
+
+```
+graph data (node_link format from networkx)
+      │
+      ▼
+D3 force simulation:
+  forceLink      (hierarchy + reading_order + spatial edges)
+  forceManyBody  (charge = -120)
+  forceCenter
+  forceCollide   (radius = node_radius + 2)
+      │
+      ▼
+SVG nodes:
+  page nodes    — large circles, labeled "p.N"
+  region nodes  — small circles, coloured by block_label
+      │
+SVG edges:
+  hierarchy     — green  (#4ade80)
+  reading_order — blue   (#60a5fa)
+  spatial       — orange (#f59e0b), opacity ∝ weight
+```
+
+**Legend:**
+
+| Colour | Edge type |
+|---|---|
+| 🟢 Green | Hierarchy (page → region) |
+| 🔵 Blue | Reading order (region → next region) |
+| 🟡 Orange | Spatial proximity (bidirectional) |
+
+### 6.3 RAG Chat Panel
+
+- Sends `POST /query/stream` to Space 2 and renders tokens via **Server-Sent Events**
+- Shows retrieved source chunks (page, section, score) in a collapsible "Sources" drawer
+- Supports multiple documents: `doc_name` field sent per query, or left empty to search all indexed documents
+- "New Doc" button resets the workspace and allows uploading a fresh document
+
+---
+
+## 7. Shared Data Contract
+
+`IngestPayload` is the JSON blob that Space 1 produces and Space 2 consumes. Both sides validate against it.
+
+```json
+{
+  "doc_name": "DAA_Project_File_Final",
+  "total_pages": 11,
+  "graph": {
+    "directed": true,
+    "multigraph": false,
+    "graph": { "doc_name": "DAA_Project_File_Final" },
+    "nodes": [
+      { "id": "page_1", "node_type": "page", "page_num": 1 },
+      { "id": "page1_block0", "node_type": "region", "page_num": 1,
+        "block_label": "title", "block_bbox": [72, 120, 540, 145],
+        "block_content": "Wireless Sensor Network Coverage Optimization" }
+    ],
+    "links": [
+      { "source": "page_1", "target": "page1_block0",
+        "edge_type": "hierarchy", "weight": 1.0 }
+    ]
+  },
+  "reading_order": ["page1_block0", "page1_block1", "page1_block2"],
+  "chunks": [
+    {
+      "chunk_id": "a3f2b1c4",
+      "doc_name": "DAA_Project_File_Final",
+      "page_num": 1,
+      "region_type": "paragraph",
+      "text": "Wireless Sensor Network Coverage Optimization\n[Context: Wireless sensor network coverage is a classic...]\nThis project addressed the wireless sensor network...",
+      "section_title": "Abstract",
+      "bbox": [72.0, 180.0, 540.0, 420.0],
+      "confidence": 1.0,
+      "char_count": 312,
+      "table_html": null,
+      "figure_path": null
+    }
+  ]
+}
+```
+
+**`RAGResponse`** (Space 2 → Frontend):
+
+```json
+{
+  "question": "What is the objective of this paper?",
+  "answer": "The paper addresses wireless sensor network coverage optimization...",
+  "retrieved_chunks": [
+    {
+      "chunk_id": "a3f2b1c4",
+      "doc_name": "DAA_Project_File_Final",
+      "page_num": 1,
+      "region_type": "paragraph",
+      "section_title": "Abstract",
+      "text": "...",
+      "score": 0.8341,
+      "table_html": null
+    }
+  ],
+  "doc_names_searched": ["DAA_Project_File_Final"]
+}
 ```
 
 ---
 
-## Known Limitations
+## 8. Configuration Reference
 
-- **In-memory only** — all indexed documents lost on Space restart. Re-upload to re-index.
-- **No figure understanding** — figures emit a stub chunk with OCR'd caption text only. No vision model describes image content.
-- **BGE-small (384d)** — weaker on technical/scientific vocabulary than larger models. Upgrade to `BAAI/bge-base-en-v1.5` (768d) for better retrieval at ~2× embedding cost.
-- **3B model ceiling** — Qwen2.5-3B handles straightforward factual QA well but struggles with multi-hop reasoning, long-form synthesis, and complex table interpretation.
-- **Spatial reranker graph-match rate** — the reranker matches chunks to graph nodes via text snippet. For merged chunks the match rate is high but not 100%; unmatched chunks fall back to raw FAISS score.
-- **Single-threaded generation** — llama-cpp blocks the FastAPI thread pool during generation (~5-30s on CPU). Concurrent queries queue up.
+### Space 1 (`space1/config.py`)
+
+All variables are overridable via **HuggingFace Space → Settings → Variables**.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SPACE2_URL` | `""` | Full URL of Space 2, e.g. `https://tytonterrapin-doc-rag.hf.space` |
+| `SPACE2_WAKE_RETRIES` | `3` | How many `/health` pings before giving up on cold-start |
+| `SPACE2_WAKE_INTERVAL_S` | `10` | Seconds between wake-ping retries |
+| `SPACE2_REQUEST_TIMEOUT_S` | `120` | Timeout for the `/extract` POST |
+| `PDF_RENDER_DPI` | `300` | DPI for PyMuPDF page rasterisation |
+| `CV_ENABLE_DESKEW` | `true` | Deskew correction |
+| `CV_ENABLE_DENOISE` | `false` | Bilateral denoising (slow; for scans only) |
+| `CV_ENABLE_BINARIZE` | `false` | Otsu binarisation (hurts deep OCR) |
+| `CV_ENABLE_CLAHE` | `true` | CLAHE contrast normalisation |
+| `OCR_LIGHTWEIGHT` | `true` | Use lightweight OCR models |
+| `OCR_CPU_THREADS` | `4` | CPU thread count for OCR inference |
+| `CHUNK_TOKEN_LIMIT` | `512` | Max words per emitted chunk |
+| `CHUNK_OVERLAP` | `64` | Overlap words between consecutive chunks |
+| `PROXIMITY_THRESHOLD` | `150` | Max centroid distance (px) for spatial edges |
+
+### Space 2 (`space2/config.py`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `EMBED_MODEL_NAME` | `BAAI/bge-base-en-v1.5` | Embedding model identifier |
+| `EMBED_ONNX_DIR` | `/app/models/bge-base-onnx` | Path to ONNX weights directory |
+| `EMBED_USE_ONNX` | `true` | Use ONNX runtime (vs torch) |
+| `EMBED_BATCH_SIZE` | `32` | Chunks per embedding batch |
+| `EMBED_DIM` | `768` | Embedding dimension (must match model) |
+| `FAISS_TOP_K` | `20` | FAISS candidates before re-ranking |
+| `RETRIEVAL_TOP_K` | `5` | Final chunks returned to generator |
+| `SPATIAL_RERANK_ALPHA` | `0.15` | Spatial graph re-ranking weight |
+| `SECTION_BOOST_ALPHA` | `0.25` | Section / intro boosting weight |
+| `EARLY_PAGE_BOOST_PAGES` | `3` | Pages 1–N counted as "early" for boost |
+| `GGUF_MODEL_REPO` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | HF repo for GGUF model |
+| `GGUF_MODEL_FILE` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename |
+| `LLM_CONTEXT_LENGTH` | `4096` | llama-cpp context window |
+| `LLM_MAX_TOKENS` | `400` | Max generation tokens |
+| `LLM_TEMPERATURE` | `0.2` | Sampling temperature |
+| `LLM_N_THREADS` | `4` | CPU threads for llama-cpp |
+| `PERSIST_DIR` | `/data` | Persistent storage directory |
+
+---
+
+## 9. Known Limitations & Roadmap
+
+### Current Limitations
+
+| Area | Limitation | Planned Fix |
+|---|---|---|
+| **Reading order** | Top-to-bottom, left-to-right only. Two-column PDFs read across both columns. | Column detection via x-centroid clustering before reading order sort. |
+| **Table splitting** | Very wide tables (>512 words of text) are emitted as a single oversized chunk. Embedding quality degrades for very long inputs. | Hierarchical table chunking: emit header row + N data rows per chunk. |
+| **Multi-document retrieval** | All documents searched when `doc_name` omitted. FAISS search is O(n×d) across all docs. | Partitioned index per document; FAISS IVF index for large collections. |
+| **Scanned PDFs** | Pass 1 (vector text) returns nothing; pipeline falls through to EasyOCR on full pages, which is slower and less accurate than PaddleOCR. | Detect scanned pages (zero vector blocks) and route to PaddleOCR v3. |
+| **Cold start latency** | Space 2 free tier sleeps after ~48h. Cold start takes 30-60s (model load). | Pre-ping via Space 1's `wake_space2()` before sending payload; async job queue with polling. |
+| **Single worker** | `--workers 1` in Space 1 because EasyOCR singleton is not fork-safe. | Move EasyOCR to a subprocess worker pool; or replace with PaddleOCR which handles multiprocessing. |
+
+### Roadmap
+
+- [ ] PaddleOCR v3 / PPStructureV3 swap-in for scanned document support
+- [ ] Column detection for multi-column academic paper layouts
+- [ ] Streaming ingest progress (SSE from Space 1 during long PDFs)
+- [ ] Per-user document isolation via HF Datasets repo as persistent store
+- [ ] Reranker model (BGE-reranker-base) as a second retrieval stage
+- [ ] FAISS IVF index for collections > 10k chunks
+
+---
+
+## 10. Deployment Checklist
+
+### Space 1 (doc-ingestion)
+
+- [ ] Set `SPACE2_URL` in HF Space → Settings → Variables  
+  e.g. `https://tytonterrapin-doc-rag.hf.space`
+- [ ] Set `app_port: 7860` in `README.md` YAML header
+- [ ] Confirm `sdk: docker` in `README.md` YAML header
+- [ ] Build succeeds: `python download_models.py` pulls EasyOCR weights
+- [ ] `GET /health` returns `{"status": "ok", "space2_configured": true}`
+
+### Space 2 (doc-rag)
+
+- [ ] `EMBED_ONNX_DIR` must be `/app/models/bge-base-onnx` in Dockerfile **and** match `config.py` default
+- [ ] Build succeeds: `python download_models.py` prints:
+  ```
+  Config check passed: ONNX dir='/app/models/bge-base-onnx', dim=768
+  [1/2] Downloading GGUF ...  Saved to models/...
+  [2/2] Downloading BGE-base ONNX ...  BGE-base ONNX ready
+  All models ready.
+  ```
+- [ ] Set `app_port: 7861` in `README.md` YAML header
+- [ ] `GET /health` returns `{"embedder_ready": true, "llm_ready": true}`
+- [ ] Space has persistent storage enabled (Settings → Persistent storage → `/data`)
+
+### Frontend
+
+- [ ] `SPACE1_URL` and `SPACE2_URL` constants set in `app.js`
+- [ ] CORS: Space 1 and Space 2 both allow `*` origins (configured in `main.py`)
+- [ ] Test end-to-end: upload PDF → graph renders → question returns answer with sources

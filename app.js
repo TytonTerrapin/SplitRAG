@@ -1474,28 +1474,80 @@ async function sendQuestion() {
       top_k: 5,
     };
 
-    const r = await fetch(`${RAG_URL}/query`, {
+    const r = await fetch(`${RAG_URL}/query/stream`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(body),
-      signal:  AbortSignal.timeout(120_000),
     });
-
-    thinkingEl.remove();
 
     if (!r.ok) {
       const errText = await r.text();
       throw new Error(`HTTP ${r.status}: ${errText.slice(0, 200)}`);
     }
 
-    const result = await r.json();
-    addChatMessage('assistant', result.answer, false, result.retrieved_chunks);
+    if (thinkingEl && thinkingEl.parentNode) thinkingEl.remove();
 
+    // Create an empty chat bubble for streaming response
+    const wrapper = addChatMessage('assistant', '');
+    const bubble = wrapper.querySelector('.chat-bubble');
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let answerText = '';
+    let retrievedChunks = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep last partial line
+
+      for (const line of lines) {
+        const cleaned = line.trim();
+        if (!cleaned.startsWith('data: ')) continue;
+        const dataStr = cleaned.slice(6);
+        if (dataStr === '[DONE]') break;
+
+        try {
+          const parsed = JSON.parse(dataStr);
+          if (parsed.type === 'chunks') {
+            retrievedChunks = parsed.chunks;
+          } else if (parsed.type === 'token') {
+            answerText += parsed.text;
+            // Format on-the-fly (bolding and line breaks)
+            const formatted = escapeHtml(answerText)
+              .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+              .replace(/\n/g, '<br>');
+            bubble.innerHTML = formatted;
+
+            // Auto-scroll chat
+            const chatMessages = $('chat-messages');
+            if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+          }
+        } catch (err) {
+          console.warn('Failed to parse SSE JSON:', dataStr, err);
+        }
+      }
+    }
+
+    // Finished streaming — append sources button if we retrieved chunks
+    if (retrievedChunks && retrievedChunks.length) {
+      const srcBtn = document.createElement('button');
+      srcBtn.className = 'chat-sources-btn';
+      srcBtn.textContent = `Sources (${retrievedChunks.length})`;
+      srcBtn.addEventListener('click', () => showSources(retrievedChunks));
+      wrapper.appendChild(srcBtn);
+    }
+
+    // Save to state history
     state.chatHistory.push({ role: 'user', content: question });
-    state.chatHistory.push({ role: 'assistant', content: result.answer, sources: result.retrieved_chunks });
+    state.chatHistory.push({ role: 'assistant', content: answerText, sources: retrievedChunks });
 
   } catch (e) {
-    thinkingEl.remove();
+    if (thinkingEl && thinkingEl.parentNode) thinkingEl.remove();
     addChatMessage('assistant', `Error: ${e.message}`, false, null, true);
   }
 
