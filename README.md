@@ -11,7 +11,7 @@
 2. [Repository Layout](#2-repository-layout)
 3. [Data Flow](#3-data-flow)
 4. [Space 1 — OCR & Ingestion](#4-space-1--ocr--ingestion)
-   - 4.1 [Extraction Pipeline (three passes)](#41-extraction-pipeline-three-passes)
+   - 4.1 [Visual Layout Detection & OCR Extraction Pipeline](#41-visual-layout-detection--ocr-extraction-pipeline)
    - 4.2 [OpenCV Preprocessing](#42-opencv-preprocessing)
    - 4.3 [Chunking Strategy](#43-chunking-strategy)
    - 4.4 [Document Graph](#44-document-graph)
@@ -121,10 +121,10 @@ SplitRAG/
 ### Upload → Ingest → Index
 
 ```
-User uploads PDF
+User uploads PDF / image
       │
       ▼
-Space 1: POST /ingest
+Space 1: POST /ingest (Ingestion Engine)
       │
       ├─► pdf_to_images.load_pages()
       │       PyMuPDF renders PDF → list of BGR numpy arrays @ 300 DPI
@@ -132,38 +132,42 @@ Space 1: POST /ingest
       ├─► ocv_pipeline.preprocess_pages()
       │       deskew (minAreaRect) → CLAHE contrast normalisation
       │
+      ├─► layout_detector.detect_layout() [DocLayout-YOLO]
+      │       Segments visual regions on page & clusters headings into h1/h2/h3 levels
+      │
       ├─► ocr_engine.run_ocr()
-      │       Pass 1: PyMuPDF vector text  (instant, character-accurate)
-      │       Pass 2: pdfplumber tables    (ruled + borderless detection)
-      │              └─ fallback: fitz.find_tables()
-      │       Pass 3: EasyOCR on embedded images (figures, scanned inserts)
-      │       → List[page_dict]  (parsing_blocks per page)
+      │       Pass 1: PyMuPDF vector text (mapped to visual bboxes via IoU >= 0.3)
+      │               Fallback: Heuristic classifier with font-name bold fallback, numbering & all-caps rules
+      │       Pass 2: Tables via pdfplumber (rules + whitespace snapping) with fitz fallback
+      │       Pass 3: OpenCV + EasyOCR text recognition on figures/embedded images
+      │       → Emits blocks sorted in column-aware reading order (preventing column interleaving)
       │
       ├─► chunker.chunk_document()
-      │       Sentence-boundary split → context carry-forward → title absorption
-      │       → List[Chunk]
+      │       Sentence-boundary splits, context carry-forward prefix, title absorption
+      │       Attaches source_block_id to link chunks to graph nodes
+      │       → List[Chunk] (metadata-only section titles to save 15-20% tokens)
       │
       ├─► graph_builder.build_graph()
-      │       hierarchy edges  (page → region)
-      │       reading_order edges (region → next region)
-      │       spatial edges   (region ↔ nearby region, weight = 1 - dist/threshold)
+      │       page-to-region hierarchy edges
+      │       reading_order edges (strictly preserves column-aware reading order)
+      │       section_hierarchy edges (links subheadings to parents via h_level)
+      │       spatial edges (centroid proximity weights)
       │       → nx.DiGraph
       │
       ├─► serialiser.build_payload()
-      │       → IngestPayload dict  (doc_name, total_pages, graph, reading_order, chunks)
+      │       Generates block_to_chunks bridge mapping
+      │       → IngestPayload dict (doc_name, total_pages, graph, reading_order, block_to_chunks, chunks)
       │
       └─► client.extract()  ──────────────────────────────────────────────────▶
-                                                                    Space 2: POST /extract
+                                                                    Space 2: POST /extract (RAG Backend)
                                                                           │
                                                                           ├─► embedder.encode_chunks()
-                                                                          │       BGE-base ONNX
-                                                                          │       batched mean-pool
-                                                                          │       L2-normalise
+                                                                          │       BGE-base ONNX mean-pool & L2-normalize
                                                                           │
                                                                           ├─► store.add_document()
                                                                           │       FAISS IndexFlatIP.add()
-                                                                          │       build chunk→node map
-                                                                          │       pickle to /data
+                                                                          │       stores graph and O(1) chunk_to_node map
+                                                                          │       pickles all data to /data mount
                                                                           │
                                                                           └─► IngestResponse  ◀────────
 ```
@@ -206,54 +210,65 @@ Space 2: POST /query  (or /query/async, /query/stream)
 **Port:** `7860`  
 **Base image:** `python:3.10-slim`
 
-### 4.1 Extraction Pipeline (three passes)
+### 4.1 Visual Layout Detection & OCR Extraction Pipeline
 
-The pipeline runs three complementary passes per page so each content type is handled by the tool best suited to it:
+Space 1 runs a two-tiered hybrid ingestion pipeline. It first performs optional visual layout analysis, then runs a three-pass hybrid OCR engine to extract high-fidelity text, tables, and images while maintaining visual and reading-order layout structure.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Page image (300 DPI numpy array)                           │
 │                                                             │
-│  Pass 1 — PyMuPDF vector text                               │
+│  Stage 1 — Visual Layout Detection (DocLayout-YOLO)         │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │ fitz.get_text("dict")                                │   │
-│  │ classify: title / text / header / footer             │   │
-│  │ suppress blocks overlapping detected table bboxes    │   │
+│  │ detect_layout() via YOLOv8x DocStructBench           │   │
+│  │ normalises labels, performs header height clustering │   │
+│  │ output: authorative LayoutRegions sorted in reading  │   │
+│  │ order (falls back to heuristics if model unavailable)│   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                             │
-│  Pass 2 — Table detection                                   │
+│  Stage 2 — Three-Pass Hybrid OCR Extraction                 │
 │  ┌──────────────────────────────────────────────────────┐   │
-│  │ pdfplumber.extract_tables()   (primary)              │   │
-│  │   ruled lines + whitespace-column snapping           │   │
-│  │ fitz.find_tables()            (fallback if pp=0)     │   │
-│  │ deduplicate by IoU > 0.5                             │   │
-│  │ emit: block_content (plain text) + block_html        │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-│  Pass 3 — Embedded images / figures                         │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ fitz.get_images() → extract_image() → numpy array   │   │
-│  │ skip < 50×50 px (icons / decorative)                 │   │
-│  │ OCV preprocessing → EasyOCR.readtext()               │   │
-│  │ bbox from fitz.get_image_info()                      │   │
+│  │ Pass 1: PyMuPDF vector text (mapped to visual blocks)│   │
+│  │ Pass 2: Tables via pdfplumber (rules + whitespace)   │   │
+│  │ Pass 3: Figures via OpenCV (preprocess) + EasyOCR   │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                             │
 │  Merge all blocks → column-aware sorting → page_dict       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Title classifier heuristic** (in `_classify_text_block`):
+#### 4.1.1 Visual Layout Detection (`layout_detector.py`)
+To index visual elements accurately, Space 1 runs a YOLO-based deep learning detector before performing OCR:
+- **Model**: `juliozhao/DocLayout-YOLO-DocStructBench` (a YOLOv8x backbone model fine-tuned on DocLayNet). It runs on CPU (~0.4s to 0.8s for 1024px page image) and segments regions visually.
+- **Labels**: Normalizes detections into 9 semantic classes: `title`, `section_header`, `text`, `table`, `caption`, `footnote`, `list_item`, `formula`, and `noise`.
+- **Dynamic Hierarchy Assignment**: Gathers bounding-box heights of all heading/title regions across the document, and clusters them using a gap-based clustering algorithm into up to 3 height bands. These represent heading levels `h1`, `h2`, and `h3` (since larger rendered box height corresponds to larger font size). Document titles are pinned to `h1` by default.
+- **Fallback Rule**: If `ultralytics` or PyTorch is not available, layout detection is bypassed and the engine defaults to Pass 1 rule-based text heuristics.
 
-| Condition | Label |
-|---|---|
-| ≤ 10 words AND `bbox.y1 < 55 pt` | `header` |
-| ≤ 10 words AND `bbox.y2 > 770 pt` | `footer` |
-| ≥ 40% of lines match TOC dot-leader regex | `text` (suppress) |
-| `len(text) < 4` | `text` |
-| ≤ 15 words AND (`avg_font_size ≥ 13` OR `bold`) | `title` |
-| else | `text` |
+#### 4.1.2 Three-Pass Hybrid OCR Extraction (`ocr_engine.py`)
+1. **Pass 1 — Vector Text Extraction (PyMuPDF)**:
+   - Reads text directly from the PDF vector layer (instant and character-accurate).
+   - If visual layout regions are available, text spans are matched to visual bboxes via spatial overlap (IoU $\ge 0.3$) to inherit the visual model's labels.
+   - If visual layout is bypassed or fails, a rule-based **heuristic classifier** (`_classify_text_block`) is used:
+     - **Bold Detection**: PyMuPDF bold flags can be missing or unreliable. The classifier checks the font name string for substrings like `bold`, `black`, `heavy`, `semibold`, and `medium` as a robust fallback.
+     - **Numbered Section Headings**: Regex pattern matches numbered headings (e.g. `3. Parsing Methodology`, `IV. Discussion`, `A. Analysis`).
+     - **All-Caps Headings**: Recognizes uppercase section titles (e.g., `PARSING METHODOLOGY`).
+     - **Header/Footer Rules**: Identifies headers/footers based on vertical boundaries (`bbox.y1 < 55 pt` and `bbox.y2 > 770 pt`).
+     - **TOC Suppression**: Suppresses Table of Contents entries using dot-leader detection (`_TOC_LINE_RE`).
+2. **Pass 2 — Table Extraction (pdfplumber)**:
+   - Uses `pdfplumber` to extract tables based on ruled lines or whitespace alignment (enabling extraction of borderless LaTeX tables).
+   - Falls back to PyMuPDF's `fitz.find_tables()` if `pdfplumber` yields no tables.
+   - Outputs both plain text and structured HTML representation (`table_html`).
+   - Suppresses vector text blocks that overlap table bboxes to prevent double-counting.
+3. **Pass 3 — Embedded Images / Figures (EasyOCR)**:
+   - Extracts images via PyMuPDF, filters out tiny icons ($< 50\times 50$ px), and preprocesses them via OpenCV (deskewing + CLAHE contrast normalization).
+   - Runs `EasyOCR` on the preprocessed image to extract chart labels, figure captions, or scanned inserts, emitting them as `figure` region blocks.
 
-> **Note:** coordinates from `fitz.get_text("dict")` are in PDF points (72 dpi space), so the pixel thresholds above are correct for that coordinate system — not for the 300 DPI rasterised image.
+#### 4.1.3 Column-Aware Reading Order Sorting
+To prevent multi-column layouts (e.g. academic articles) from being scrambled:
+1. The engine scans the page vertically to identify full-width spanning blocks (e.g., titles, section headers, full-width tables/figures) which act as horizontal delimiters.
+2. It partitions the page vertically by these spanning blocks.
+3. Inside each partition, blocks are split into left and right columns based on their center X-coordinates.
+4. The columns are sorted top-to-bottom independently, and left blocks are emitted before right blocks, preventing columns from being interleaved in the logical text stream.
 
 ### 4.2 OpenCV Preprocessing
 
@@ -284,62 +299,25 @@ Optional (disabled by default):
 
 ### 4.3 Chunking Strategy
 
-`chunker.py` implements five techniques layered on top of each other:
+`chunker.py` implements the following techniques to split document content into vector-store-ready chunks:
 
-```
-Raw parsing_blocks (per page)
-      │
-      ▼  1. TOC page filter
-   Skip pages with ≥ 3 dot-leader blocks
-      │
-      ▼  2. Noise filter
-   Skip: bbox width < 15px, DOIs, bare URLs, page numbers,
-         publisher metadata, copyright lines
-      │
-      ▼  3. Block merging
-   Adjacent paragraph blocks accumulated in para_buffer
-   Flush when word count ≥ MERGE_TARGET_WORDS (350)
-   or when a title / table / figure is encountered
-      │
-      ▼  4. Title absorption
-   Titles are NOT emitted as standalone chunks.
-   Instead, the title text is prepended to the first
-   paragraph chunk that follows it.
-   → Eliminates content-free title slots in top-k retrieval.
-      │
-      ▼  5. Sentence-boundary split + sentence-aligned overlap
-   _split_sentences_into_chunks(text, limit=512, overlap=64)
-   Sentences identified by:  (?<=[.!?])\s+(?=[A-Z\"'])
-   Overlap = last complete sentence(s) from previous chunk
-   that fit within OVERLAP_WORDS (64).
-      │
-      ▼  6. Context carry-forward (contextual retrieval)
-   Each chunk prefixed with:
-   [Context: <first sentence of previous chunk>]
-   ~15-25 extra tokens; significantly improves mid-document
-   retrieval for questions without explicit section references.
-      │
-      ▼
-   List[Chunk]
-   Tables: always atomic (never split), carry table_html
-   Figures: stub chunk with EasyOCR text as content
-```
+1. **TOC Page Suppression**: Skips pages containing 3 or more dot-leader blocks to avoid indexing table-of-contents lists.
+2. **Noise Filtering**: Drops tiny blocks ($<15$ px width), publisher metadata, copyright lines, DOIs, bare URLs, and page numbers.
+3. **Smart Paragraph Merging**: Accumulates adjacent paragraph blocks in a buffer and flushes them when word count reaches `MERGE_TARGET_WORDS` (350 words) or when a title, table, or figure is encountered.
+4. **Title Absorption**: To prevent content-free chunks, headings are absorbed by prepending the title text to the first paragraph chunk that follows it.
+5. **Sentence-Aligned Splitting & Overlap**: Splits merged paragraphs into chunks of at most `CHUNK_TOKEN_LIMIT` (512 words) at sentence boundaries. Overlap is generated using the last complete sentence(s) from the previous chunk that fit within `CHUNK_OVERLAP` (64 words).
+6. **Context Carry-Forward**: Prefixes mid-document chunks with `[Context: <first sentence of previous chunk>]` to provide retrieval context.
+7. **Graph Node Linking (`source_block_id`)**: Every chunk stores the exact graph node ID (`source_block_id`, e.g., `"page1_block3"`) of the region it originated from. This links chunks directly to the document structure and reading order in the UI layout viewer, bridging the namespace gap.
+8. **Token Efficiency**: The section title metadata is no longer prepended inside the chunk text body, eliminating redundant text repetitions and saving 15-20% tokens per chunk. Heading whitespace is also normalized (e.g., `3\nIntroduction` -> `3 Introduction`).
 
 ### 4.4 Document Graph
 
-`graph_builder.py` builds a `nx.DiGraph` with three edge types:
+`graph_builder.py` constructs a single `nx.DiGraph` representing the document's logical, hierarchical, and spatial layout:
 
-```
-page_1  ──(hierarchy)──▶  page1_block0
-                          page1_block1
-                          page1_block2
-                               │
-        page1_block0 ──(reading_order)──▶ page1_block1
-        page1_block1 ──(reading_order)──▶ page1_block2
-                               │
-        page1_block0 ◀──(spatial)──▶ page1_block1
-              weight = 1 - dist/PROXIMITY_THRESHOLD (150px)
-```
+- **Hierarchy Edges**: Direct link from page node to region nodes on that page (`page_num -> region_id`, weight = 1.0).
+- **Section Hierarchy Edges**: Direct link from a heading node to its parent heading node (e.g. `h1 -> h2`, weight = 1.0) based on their dynamically assigned `h_level` attribute. This allows tracing section context.
+- **Reading Order Edges**: Direct links from each region node to the next logical region node (`region_a -> region_b`, weight = 1.0) on the same page. This strictly follows the column-aware reading order established by the OCR engine, resolving the coordinate-based re-sorting bug that previously scrambled layout blocks.
+- **Spatial Edges**: Bidirectional links between region nodes whose centroids are within `PROXIMITY_THRESHOLD` (150px). The weight is computed as $1 - \frac{\text{distance}}{\text{threshold}}$, giving higher weights to adjacent regions.
 
 **Node attributes:**
 
@@ -646,7 +624,8 @@ SVG edges:
       { "id": "page_1", "node_type": "page", "page_num": 1 },
       { "id": "page1_block0", "node_type": "region", "page_num": 1,
         "block_label": "title", "block_bbox": [72, 120, 540, 145],
-        "block_content": "Wireless Sensor Network Coverage Optimization" }
+        "block_content": "Wireless Sensor Network Coverage Optimization",
+        "h_level": 1 }
     ],
     "links": [
       { "source": "page_1", "target": "page1_block0",
@@ -654,6 +633,9 @@ SVG edges:
     ]
   },
   "reading_order": ["page1_block0", "page1_block1", "page1_block2"],
+  "block_to_chunks": {
+    "page1_block0": ["a3f2b1c4"]
+  },
   "chunks": [
     {
       "chunk_id": "a3f2b1c4",
@@ -666,7 +648,8 @@ SVG edges:
       "confidence": 1.0,
       "char_count": 312,
       "table_html": null,
-      "figure_path": null
+      "figure_path": null,
+      "source_block_id": "page1_block0"
     }
   ]
 }
