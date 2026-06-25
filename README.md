@@ -238,7 +238,7 @@ The pipeline runs three complementary passes per page so each content type is ha
 │  │ bbox from fitz.get_image_info()                      │   │
 │  └──────────────────────────────────────────────────────┘   │
 │                                                             │
-│  Merge all blocks → sort by (y, x) → page_dict             │
+│  Merge all blocks → column-aware sorting → page_dict       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -298,7 +298,7 @@ Raw parsing_blocks (per page)
       │
       ▼  3. Block merging
    Adjacent paragraph blocks accumulated in para_buffer
-   Flush when word count ≥ MERGE_TARGET_WORDS (200)
+   Flush when word count ≥ MERGE_TARGET_WORDS (350)
    or when a title / table / figure is encountered
       │
       ▼  4. Title absorption
@@ -353,7 +353,7 @@ page_1  ──(hierarchy)──▶  page1_block0
 }
 ```
 
-> **Known limitation:** reading order is top-to-bottom, left-to-right only. Multi-column layouts (two columns) will read across both columns incorrectly. Column detection (clustering x-centroids) is the fix and is on the roadmap.
+> **Column-Aware Reading Order**: Layout extraction dynamically partitions the page horizontally using full-width spanning headers and blocks. Blocks within each partitioned section are sorted top-to-bottom column-by-column (left and right separately), preventing columns from being interleaved.
 
 ### 4.5 API Endpoints
 
@@ -511,8 +511,8 @@ for chunk in sorted_chunks:
 | Phase | Time |
 |---|---|
 | Prefill (~800 prompt tokens) | ~2s |
-| Generation (400 output tokens) | ~50s |
-| Total | ~52s |
+| Generation (250 output tokens) | ~30s |
+| Total | ~32s |
 | ThreadPoolExecutor safety timeout | 110s |
 
 **SIGALRM handling:** llama-cpp sets a SIGALRM watchdog at model load time. `signal.signal(SIGALRM, SIG_IGN)` is called once in `Generator.load()` — which runs in the lifespan startup (main thread). Worker threads cannot call `signal.signal()`, hence the `ThreadPoolExecutor` wrapping `generate()` for a wall-clock timeout without touching signals.
@@ -736,7 +736,7 @@ All variables are overridable via **HuggingFace Space → Settings → Variables
 | `GGUF_MODEL_REPO` | `Qwen/Qwen2.5-3B-Instruct-GGUF` | HF repo for GGUF model |
 | `GGUF_MODEL_FILE` | `qwen2.5-3b-instruct-q4_k_m.gguf` | GGUF filename |
 | `LLM_CONTEXT_LENGTH` | `4096` | llama-cpp context window |
-| `LLM_MAX_TOKENS` | `400` | Max generation tokens |
+| `LLM_MAX_TOKENS` | `250` | Max generation tokens |
 | `LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 | `LLM_N_THREADS` | `4` | CPU threads for llama-cpp |
 | `PERSIST_DIR` | `/data` | Persistent storage directory |
@@ -749,7 +749,6 @@ All variables are overridable via **HuggingFace Space → Settings → Variables
 
 | Area | Limitation | Planned Fix |
 |---|---|---|
-| **Reading order** | Top-to-bottom, left-to-right only. Two-column PDFs read across both columns. | Column detection via x-centroid clustering before reading order sort. |
 | **Table splitting** | Very wide tables (>512 words of text) are emitted as a single oversized chunk. Embedding quality degrades for very long inputs. | Hierarchical table chunking: emit header row + N data rows per chunk. |
 | **Multi-document retrieval** | All documents searched when `doc_name` omitted. FAISS search is O(n×d) across all docs. | Partitioned index per document; FAISS IVF index for large collections. |
 | **Scanned PDFs** | Pass 1 (vector text) returns nothing; pipeline falls through to EasyOCR on full pages, which is slower and less accurate than PaddleOCR. | Detect scanned pages (zero vector blocks) and route to PaddleOCR v3. |
@@ -759,7 +758,7 @@ All variables are overridable via **HuggingFace Space → Settings → Variables
 ### Roadmap
 
 - [ ] PaddleOCR v3 / PPStructureV3 swap-in for scanned document support
-- [ ] Column detection for multi-column academic paper layouts
+- [x] Column detection for multi-column academic paper layouts
 - [ ] Streaming ingest progress (SSE from Space 1 during long PDFs)
 - [ ] Per-user document isolation via HF Datasets repo as persistent store
 - [ ] Reranker model (BGE-reranker-base) as a second retrieval stage
