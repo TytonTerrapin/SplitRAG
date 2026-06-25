@@ -411,7 +411,7 @@ async function runPipeline() {
     gsap.from(statsPanel, { opacity: 0, y: 10, duration: 0.4 });
 
     const totalPages = data.total_pages ?? 0;
-    const totalChunks = data.total_chunks ?? data.chunks?.length ?? 0;
+    const totalChunks = data.chunks?.length ?? 0;
     const graphNodes = data.graph?.nodes?.length ?? 0;
     const graphEdges = data.graph?.links?.length ?? 0;
 
@@ -470,10 +470,16 @@ async function forwardToRAG(data) {
   if (!data.chunks || !data.chunks.length) return;
 
   const docName = state.file?.name ?? 'untitled';
+  const ragGraph = {
+    nodes: data.graph?.nodes ?? [],
+    links: (data.graph?.links || []).filter(l =>
+      l.edge_type === 'hierarchy' || l.edge_type === 'reading_order'
+    ),
+  };
   const payload = {
     doc_name:      docName,
     total_pages:   data.total_pages ?? 0,
-    graph:         data.graph ?? { nodes: [], links: [] },
+    graph:         ragGraph,
     reading_order: data.reading_order ?? [],
     chunks:        data.chunks.map(c => ({
       chunk_id:      c.chunk_id ?? '',
@@ -523,6 +529,35 @@ async function forwardToRAG(data) {
 function onWorkspaceEnter() {
   const data = state.lastPayload;
   if (!data) return;
+
+  // Build bidirectional lookup maps between graph nodes and document chunks
+  const blockToChunk = {};
+  const chunkToBlock = {};
+  if (data.chunks && data.graph && data.graph.nodes) {
+    const normalizeText = str => (str || '').trim().replace(/\s+/g, ' ');
+    const bboxesEqual = (b1, b2) => {
+      if (!b1 || !b2 || b1.length !== 4 || b2.length !== 4) return false;
+      return Math.abs(b1[0] - b2[0]) < 1 &&
+             Math.abs(b1[1] - b2[1]) < 1 &&
+             Math.abs(b1[2] - b2[2]) < 1 &&
+             Math.abs(b1[3] - b2[3]) < 1;
+    };
+
+    data.chunks.forEach(c => {
+      const node = data.graph.nodes.find(n => {
+        if (n.node_type === 'page' || n.page_num !== c.page_num) return false;
+        if (n.block_content && c.text && normalizeText(n.block_content) === normalizeText(c.text)) return true;
+        if (n.bbox && c.bbox && bboxesEqual(n.bbox, c.bbox)) return true;
+        return false;
+      });
+      if (node) {
+        blockToChunk[node.id] = c.chunk_id;
+        chunkToBlock[c.chunk_id] = node.id;
+      }
+    });
+  }
+  state.blockToChunkMap = blockToChunk;
+  state.chunkToBlockMap = chunkToBlock;
 
   // Set doc name — use currentDocName for restored docs
   $('ws-doc-name').textContent = state.currentDocName || state.file?.name || 'Document';
@@ -1091,16 +1126,27 @@ function renderGraph(graphData, chunks) {
   if (graphData && graphData.nodes && graphData.nodes.length) {
     nodes = graphData.nodes.map(n => {
       const type = n.node_type === 'page' ? 'page' : (n.block_label || 'text');
+      const label = n.label || (n.node_type === 'page'
+        ? `Page ${n.page_num}`
+        : truncate(n.block_content || n.id, 30));
       return {
         ...n,
         type: type,
-        label: n.label || n.block_content || (type === 'page' ? `Page ${n.page_num}` : n.id)
+        label: label
       };
     });
     links = graphData.links.map(l => ({
       ...l,
       type: l.edge_type || 'hierarchy'
     }));
+
+    // Cap spatial edges to prevent performance degradation in simulation
+    const MAX_SPATIAL = 200;
+    let spatialCount = 0;
+    links = links.filter(l => {
+      if (l.type !== 'spatial') return true;
+      return spatialCount++ < MAX_SPATIAL;
+    });
   } else if (chunks && chunks.length) {
     // Generate graph from chunks
     const pageNodes = new Set();
@@ -1372,7 +1418,8 @@ function selectGraphNode(nodeId, nodeSelection, linkSelection) {
   }
 }
 
-function highlightGraphNode(nodeId) {
+function highlightGraphNode(chunkId) {
+  const nodeId = state.chunkToBlockMap?.[chunkId] ?? chunkId;
   const svg = d3.select('#graph-svg');
   svg.selectAll('.graph-node').classed('selected', d => d.id === nodeId);
   svg.selectAll('.graph-link').classed('highlighted', d =>
@@ -1381,7 +1428,8 @@ function highlightGraphNode(nodeId) {
   state.selectedNodeId = nodeId;
 }
 
-function highlightDocChunk(chunkId) {
+function highlightDocChunk(nodeId) {
+  const chunkId = state.blockToChunkMap?.[nodeId] ?? nodeId;
   const card = document.querySelector(`.chunk-card[data-chunk-id="${chunkId}"]`);
   if (card) {
     document.querySelectorAll('.chunk-card.highlighted').forEach(c => c.classList.remove('highlighted'));
