@@ -1645,6 +1645,29 @@ function initNavigation() {
   // Ingest success → Workspace
   $('view-workspace-btn').addEventListener('click', () => showScreen('workspace'));
 
+  // Download parsed JSON payload
+  $('ws-download-json').addEventListener('click', () => {
+    if (!state.lastPayload) {
+      alert("No document payload loaded to export.");
+      return;
+    }
+    try {
+      const jsonStr = JSON.stringify(state.lastPayload, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${state.currentDocName || 'document'}_parsed.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to export JSON:", err);
+      alert("An error occurred while generating the JSON file.");
+    }
+  });
+
   // Workspace → Ingest (new doc)
   $('ws-new-doc').addEventListener('click', () => {
     // Reset state
