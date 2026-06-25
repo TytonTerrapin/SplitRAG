@@ -1,4 +1,4 @@
-# doc/intel — Architecture & Developer Reference
+# SplitRAG — Architecture & Developer Reference
 
 > **Two-Space document intelligence pipeline on HuggingFace.**  
 > Upload a PDF → OCR + graph extraction → vector index → RAG Q&A, all running on free CPU tiers.
@@ -72,14 +72,14 @@
 | Free CPU tier only | No GPU available. All models chosen for CPU viability: ONNX embedding (~30ms/chunk), GGUF Q4 inference (~8 tok/s). |
 | FAISS IndexFlatIP | Exact inner-product search. No approximation error, sufficient for document-scale (<10k chunks). |
 | Persistent `/data` volume | HF Spaces free tier loses RAM on sleep. FAISS index + metadata pickled to `/data` so documents survive restarts without re-ingestion. |
-| Async job queue | HF proxy times out at ~120s. `/ingest` and `/query` use job IDs + polling so the browser never hits a gateway timeout. |
+| Real-time streaming | HF proxy times out at ~120s if connection is idle. `/query/stream` uses Server-Sent Events (SSE) to write token events in real-time, keeping the connection active and preventing gateway timeouts. |
 
 ---
 
 ## 2. Repository Layout
 
 ```
-doc-intel/
+SplitRAG/
 ├── space1/                     # HuggingFace Space: doc-ingestion
 │   ├── main.py                 # FastAPI app — all endpoints
 │   ├── ocr_engine.py           # Three-pass extraction (PyMuPDF + pdfplumber + EasyOCR)
@@ -752,7 +752,7 @@ All variables are overridable via **HuggingFace Space → Settings → Variables
 | **Table splitting** | Very wide tables (>512 words of text) are emitted as a single oversized chunk. Embedding quality degrades for very long inputs. | Hierarchical table chunking: emit header row + N data rows per chunk. |
 | **Multi-document retrieval** | All documents searched when `doc_name` omitted. FAISS search is O(n×d) across all docs. | Partitioned index per document; FAISS IVF index for large collections. |
 | **Scanned PDFs** | Pass 1 (vector text) returns nothing; pipeline falls through to EasyOCR on full pages, which is slower and less accurate than PaddleOCR. | Detect scanned pages (zero vector blocks) and route to PaddleOCR v3. |
-| **Cold start latency** | Space 2 free tier sleeps after ~48h. Cold start takes 30-60s (model load). | Pre-ping via Space 1's `wake_space2()` before sending payload; async job queue with polling. |
+| **Cold start latency** | Space 2 free tier sleeps after ~48h. Cold start takes 30-60s (model load). | Pre-ping via Space 1's `wake_space2()` before sending payload; real-time SSE query streaming to bypass timeouts. |
 | **Single worker** | `--workers 1` in Space 1 because EasyOCR singleton is not fork-safe. | Move EasyOCR to a subprocess worker pool; or replace with PaddleOCR which handles multiprocessing. |
 
 ### Roadmap
