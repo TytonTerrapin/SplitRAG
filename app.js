@@ -413,7 +413,7 @@ async function runPipeline() {
     const totalPages = data.total_pages ?? 0;
     const totalChunks = data.chunks?.length ?? 0;
     const graphNodes = data.graph?.nodes?.length ?? 0;
-    const graphEdges = data.graph?.links?.length ?? 0;
+    const graphEdges = (data.graph?.edges ?? data.graph?.links)?.length ?? 0;
 
     animateCounter('s-pages', totalPages);
     animateCounter('s-chunks', totalChunks);
@@ -472,7 +472,7 @@ async function forwardToRAG(data) {
   const docName = state.file?.name ?? 'untitled';
   const ragGraph = {
     nodes: data.graph?.nodes ?? [],
-    links: (data.graph?.links || []).filter(l =>
+    links: (data.graph?.edges ?? data.graph?.links ?? []).filter(l =>
       l.edge_type === 'hierarchy' || l.edge_type === 'reading_order'
     ),
   };
@@ -568,8 +568,11 @@ function onWorkspaceEnter() {
   // Render document viewer
   renderDocViewer(data);
 
-  // Render graph
-  renderGraph(data.graph, data.chunks);
+  // Render graph — defer to next paint so the flex layout has settled
+  // and getBoundingClientRect() returns real dimensions
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    renderGraph(data.graph, data.chunks);
+  }));
 
   // Update health indicators
   pingHealth();
@@ -1135,7 +1138,7 @@ function renderGraph(graphData, chunks) {
         label: label
       };
     });
-    links = graphData.links.map(l => ({
+    links = (graphData.edges ?? graphData.links ?? []).map(l => ({
       ...l,
       type: l.edge_type || 'hierarchy'
     }));

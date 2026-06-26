@@ -1162,6 +1162,8 @@ html, body {
 .graph-body {
   position: relative;
   overflow: hidden;
+  flex: 1;
+  min-height: 0;
 }
 
 #graph-svg {
