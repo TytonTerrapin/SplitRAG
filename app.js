@@ -1522,7 +1522,6 @@ async function sendQuestion() {
     const body = {
       question,
       doc_name: state.currentDocName || undefined,
-      top_k: 5,
     };
 
     const r = await fetch(`${RAG_URL}/query/stream`, {
