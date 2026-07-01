@@ -1547,6 +1547,27 @@ async function sendQuestion() {
     let answerText = '';
     let retrievedChunks = null;
 
+    // rAF-batched render — accumulate tokens and repaint at most once per frame.
+    let rafPending = false;
+    let pendingText = '';
+
+    function scheduleRender() {
+      if (rafPending) return;
+      rafPending = true;
+      requestAnimationFrame(() => {
+        rafPending = false;
+        if (!pendingText) return;
+        answerText += pendingText;
+        pendingText = '';
+        const formatted = escapeHtml(answerText)
+          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\n/g, '<br>');
+        bubble.innerHTML = formatted;
+        const chatMessages = $('chat-messages');
+        if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+      });
+    }
+
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -1566,21 +1587,22 @@ async function sendQuestion() {
           if (parsed.type === 'chunks') {
             retrievedChunks = parsed.chunks;
           } else if (parsed.type === 'token') {
-            answerText += parsed.text;
-            // Format on-the-fly (bolding and line breaks)
-            const formatted = escapeHtml(answerText)
-              .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-              .replace(/\n/g, '<br>');
-            bubble.innerHTML = formatted;
-
-            // Auto-scroll chat
-            const chatMessages = $('chat-messages');
-            if (chatMessages) chatMessages.scrollTop = chatMessages.scrollHeight;
+            pendingText += parsed.text;
+            scheduleRender();
           }
         } catch (err) {
           console.warn('Failed to parse SSE JSON:', dataStr, err);
         }
       }
+    }
+
+    // Flush any remaining tokens after the stream ends
+    if (pendingText) {
+      answerText += pendingText;
+      const formatted = escapeHtml(answerText)
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>');
+      bubble.innerHTML = formatted;
     }
 
     // Finished streaming — append sources button if we retrieved chunks
